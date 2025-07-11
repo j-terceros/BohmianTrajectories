@@ -1,5 +1,3 @@
-Aquí tienes el archivo `README.md` corregido y formateado correctamente en Markdown:
-
 ````markdown
 # 2D Bohmian Trajectory Simulation in Julia
 
