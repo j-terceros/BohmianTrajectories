@@ -9,17 +9,17 @@ x = collect(range(-Lx/2, stop=Lx/2 - dx, length=Nx))
 kx  = 2π .* fftfreq(Nx, 1/dx)
 
 
-α0x = 5/2
+α0x = 0.0
 σx  = 0.0
 ωx  = 1.0
-κ   = -0.1
-ν   = 0.1
+κ   = -1.0
+ν   = 1.0
 const ħ = 1.0
 const m = 1.0
 
 p = (ħ, m, κ, ν, ωx)
 
-tspan = (0.0, 0.5)
+tspan = (0.0, 10.0)
 
 # Reusable FFT plans and buffers
 ψbuf  = zeros(ComplexF64, Nx)
@@ -101,13 +101,15 @@ end
 
 prob = SplitODEProblem(decoherence!, schrodinger!, ψ0, tspan)
 
-sol = solve(prob, KenCarp47(autodiff = AutoFiniteDiff()), reltol=1e-10, abstol=1e-10; saveat = 0.001)
+sol = solve(prob, KenCarp47(autodiff = AutoFiniteDiff()), reltol=1e-15, abstol=1e-15; saveat = 0.001)
 
 t_vals = tspan[1]:0.1:tspan[2]
 
 ψf = coherent1D(x, α0x, σx, ωx, tspan[2])
 
-δ0 = [sqrt(1/(2ωx)), 0.0]
+# dδ0 = κ * sqrt(1/(2ωx))
+
+δ0 = [sqrt(1/(2ωx)), κ*sqrt(1/(2ωx))]
 
 δf = width(ψf, x, dx)
 
@@ -128,12 +130,17 @@ end
 fig = Figure()
 ax = Axis(fig[1, 1], xlabel="X", ylabel="Real Part of the Wave Function - Final State (S-ODE)")
 lines!(ax, x, real.(sol.u[end]), label="Decoherence", color=:blue, linestyle=:dash)
-lines!(ax, x, real.(ψf), label="No-Decoherence", color=:red)
+lines!(ax, x, real.(ψf), label="No-Decoherence", color=(:red, 0.5))
 axislegend(ax)
-display(fig)
 
 ax1 = Axis(fig[1, 2], xlabel="Time", ylabel="Width")
 lines!(ax1, sol_δ.t, δ_all, label="Simulated", color=:green, linestyle=:dash)
-lines!(ax1, sol_δ.t, δ_dδ[:, 1], label="Analytical", color=:red)
+lines!(ax1, sol_δ.t, δ_dδ[:, 1], label="Analytical", color=(:red, 0.5))
 axislegend(ax1)
+
+ax2 = Axis(fig[1, 3], xlabel="X", ylabel="Probability Density - Final State (S-ODE)")
+lines!(ax2, x, abs2.(sol.u[end]), label="Decoherence", color=:blue, linestyle=:dash)
+lines!(ax2, x, abs2.(ψf), label="No-Decoherence", color=(:red, 0.5))
+axislegend(ax2)
+
 display(fig)
