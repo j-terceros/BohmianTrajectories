@@ -18,11 +18,11 @@ function main()
     ωx  = 1.0;
     κ   = -1.0;
     ν   = 1.0;
-    small = eps();
+    small = 1e-30;
 
     p = (ħ, m, κ, ν, ωx);
 
-    tspan = (0.0, 0.5);
+    tspan = (0.0, 5.0);
 
     # Reusable FFT plans and buffers
     # ψbuf  = zeros(ComplexF64, Nx)
@@ -62,8 +62,12 @@ function main()
     end
 
     function schrodinger!(dψ, ψ, p, t)
-        fT!(dψ, ψ, p, t)
-        fV!(dψ, ψ, p, t)
+        psi_re = @view ψ[1:Nx]
+        psi_im = @view ψ[Nx+1:end]
+        ψbuf[1:Nx] .=  Tx .* (planF * psi_im) ./ ħ
+        ψbuf[Nx+1:end] .=  -Tx .* (planF * psi_re) ./ ħ 
+        dψ[1:Nx] .= real.(planB * ψbuf[1:Nx]) .+ Vx .* (psi_im) ./ ħ  
+        dψ[Nx+1:end] .= real.(planB * ψbuf[Nx+1:end]) .- Vx .* (psi_re) ./ ħ     
     end
 
     function decoherence!(dψ, ψ, p, t)
@@ -80,8 +84,31 @@ function main()
         Λ = atan.(psi_im, psi_re) .* 2
         mean_Λ = sum(ρ .* Λ) / Z
 
-        @. dψ[1:Nx] =  -κ * (lnρ - mean_lnρ) * psi_re - (ν/2) * (Λ - mean_Λ) * psi_re
-        @. dψ[Nx+1:end] =  -κ * (lnρ - mean_lnρ) * psi_im - (ν/2) * (Λ - mean_Λ) * psi_im
+        @. dψ[1:Nx] =  -κ * (lnρ - mean_lnρ) * psi_re + (ν/2) * (Λ - mean_Λ) * psi_im
+        @. dψ[Nx+1:end] =  -κ * (lnρ - mean_lnρ) * psi_im - (ν/2) * (Λ - mean_Λ) * psi_re
+    end
+
+    function full_decoherence!(dψ, ψ, p, t)
+        psi_re = @view ψ[1:Nx]
+        psi_im = @view ψ[Nx+1:end]
+
+        ρ = @. psi_re^2 + psi_im^2 
+
+        Z = sum(ρ)
+
+        lnρ = log.(ρ .+ small)
+        mean_lnρ = sum(ρ .* lnρ) / Z
+
+        Λ = atan.(psi_im, psi_re) .* 2
+        mean_Λ = sum(ρ .* Λ) / Z
+
+        @. dψ[1:Nx] =  -κ * (lnρ - mean_lnρ) * psi_re + (ν/2) * (Λ - mean_Λ) * psi_im
+        @. dψ[Nx+1:end] =  -κ * (lnρ - mean_lnρ) * psi_im - (ν/2) * (Λ - mean_Λ) * psi_re
+
+        ψbuf[1:Nx] .=  Tx .* (planF * psi_im) ./ ħ
+        ψbuf[Nx+1:end] .=  -Tx .* (planF * psi_re) ./ ħ 
+        dψ[1:Nx] .+= real.(planB * ψbuf[1:Nx]) .+ Vx .* (psi_im) ./ ħ  
+        dψ[Nx+1:end] .+= real.(planB * ψbuf[Nx+1:end]) .- Vx .* (psi_re) ./ ħ     
     end
 
     function width(ψ, x, dx)
@@ -118,9 +145,12 @@ function main()
 
     ψ0 = coherent1D(x, α0x, σx, ωx, 0.0);
 
-    prob = SplitODEProblem(decoherence!, schrodinger!, ψ0, tspan);
+    # prob = SplitODEProblem(decoherence!, schrodinger!, ψ0, tspan);
+    prob = ODEProblem(full_decoherence!, ψ0, tspan);
 
-    sol = solve(prob, KenCarp47(), reltol=1e-13, abstol=1e-13; saveat = 0.001);
+    sol = solve(prob, FBDF(autodiff=AutoFiniteDiff()), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
+    # sol = solve(prob, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
+    # sol = solve(prob, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
 
     t_vals = tspan[1]:0.1:tspan[2];
 
@@ -132,7 +162,7 @@ function main()
 
     prob_δ = ODEProblem(diff_width, δ0, tspan, p);
 
-    sol_δ = solve(prob_δ, Vern7(), reltol=1e-15, abstol=1e-15; saveat = 0.001);
+    sol_δ = solve(prob_δ, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01);
 
     δ_dδ = reduce(vcat, [u' for u in sol_δ.u]);
 
@@ -147,8 +177,10 @@ function main()
     function ploting_result()
         fig = Figure()
         ax = Axis(fig[1, 1], xlabel="X", ylabel="Real Part of the Wave Function - Final State (S-ODE)")
-        lines!(ax, x, sol.u[end][1:Nx].^2 + sol.u[end][Nx+1:end].^2, label="Decoherence", color=:blue, linestyle=:dash)
-        lines!(ax, x, ψf[1:Nx].^2 + ψf[Nx+1:end].^2 , label="No-Decoherence", color=:red)
+        # lines!(ax, x, sol.u[end][1:Nx].^2 + sol.u[end][Nx+1:end].^2, label="Decoherence", color=:blue, linestyle=:dash)
+        # lines!(ax, x, ψf[1:Nx].^2 + ψf[Nx+1:end].^2 , label="No-Decoherence", color=:red)
+        lines!(ax, x, sol.u[end][Nx+1:end], label="Decoherence", color=:blue, linestyle=:dash)
+        lines!(ax, x, ψf[Nx+1:end] , label="No-Decoherence", color=:red)
         axislegend(ax)
 
         ax1 = Axis(fig[1, 2], xlabel="Time", ylabel="Width")
