@@ -13,16 +13,16 @@ function main()
     kx  = 2π .* fftfreq(Nx, 1/dx);
 
 
-    α0x = 0.0
-    σx  = 0.0
-    ωx  = 1.0
-    κ   = -0.01
-    ν   = 0.01
-    small = eps()
+    α0x = 0.0;
+    σx  = 0.0;
+    ωx  = 1.0;
+    κ   = -1.0;
+    ν   = 1.0;
+    small = eps();
 
     p = (ħ, m, κ, ν, ωx);
 
-    tspan = (0.0, 1.0);
+    tspan = (0.0, 0.5);
 
     # Reusable FFT plans and buffers
     # ψbuf  = zeros(ComplexF64, Nx)
@@ -132,7 +132,7 @@ function main()
 
     prob_δ = ODEProblem(diff_width, δ0, tspan, p);
 
-    sol_δ = solve(prob_δ, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.001);
+    sol_δ = solve(prob_δ, Vern7(), reltol=1e-15, abstol=1e-15; saveat = 0.001);
 
     δ_dδ = reduce(vcat, [u' for u in sol_δ.u]);
 
