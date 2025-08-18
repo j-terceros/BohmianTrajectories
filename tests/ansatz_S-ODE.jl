@@ -13,7 +13,7 @@ function main()
     kx  = 2π .* fftfreq(Nx, 1/dx);
 
 
-    α0x = 0.0;
+    α0x = 5/2;
     σx  = 0.0;
     ωx  = 1.0;
     κ   = -1.0;
@@ -22,13 +22,21 @@ function main()
 
     p = (ħ, m, κ, ν, ωx);
 
-    tspan = (0.0, 5.0);
+    tspan = (0.0, 10.0);
+    println(tspan)
 
     # Reusable FFT plans and buffers
-    # ψbuf  = zeros(ComplexF64, Nx)
     ψbuf  = zeros(ComplexF64, 2*Nx);
     planF = plan_fft(ψbuf[1:Nx]);
     planB = plan_ifft(ψbuf[1:Nx]);
+
+    # psi = rand(Float64, Nx);
+    # planF = plan_rfft(psi);
+    # ψbuf_r  = planF * psi;
+    # ψbuf_i  = similar(ψbuf_r);
+    # planB = plan_irfft(ψbuf_r, Nx);
+    # kx = kx[1:length(ψbuf_r)];
+    
 
     Vx = 0.5 * m * ωx^2 .* (x.^2);
     Tx = 0.5 * ħ^2 / m .* (kx.^2 );
@@ -82,10 +90,17 @@ function main()
         mean_lnρ = sum(ρ .* lnρ) / Z
 
         Λ = atan.(psi_im, psi_re) .* 2
-        mean_Λ = sum(ρ .* Λ) / Z
+        mean_Λ =  mean_theta(Λ, ρ)/ Z
+        desv_Λ = map(x-> min(x-mean_Λ, x + 2pi - mean_Λ), Λ )
 
-        @. dψ[1:Nx] =  -κ * (lnρ - mean_lnρ) * psi_re + (ν/2) * (Λ - mean_Λ) * psi_im
-        @. dψ[Nx+1:end] =  -κ * (lnρ - mean_lnρ) * psi_im - (ν/2) * (Λ - mean_Λ) * psi_re
+        @. dψ[1:Nx] =  -κ * (lnρ - mean_lnρ) * psi_re + (ν/2) * (desv_Λ) * psi_im
+        @. dψ[Nx+1:end] =  -κ * (lnρ - mean_lnρ) * psi_im - (ν/2) * (desv_Λ) * psi_re
+    end
+
+    function mean_theta(theta, rho)
+        sc = sincos.(theta)
+        mean_sc_theta = mapreduce((sc_ang, weight) -> [sc_ang[1]*weight, sc_ang[2]*weight], +, (sc, rho)...  )
+        return atan(mean_sc_theta[1], mean_sc_theta[2])
     end
 
     function full_decoherence!(dψ, ψ, p, t)
@@ -105,10 +120,10 @@ function main()
         @. dψ[1:Nx] =  -κ * (lnρ - mean_lnρ) * psi_re + (ν/2) * (Λ - mean_Λ) * psi_im
         @. dψ[Nx+1:end] =  -κ * (lnρ - mean_lnρ) * psi_im - (ν/2) * (Λ - mean_Λ) * psi_re
 
-        ψbuf[1:Nx] .=  Tx .* (planF * psi_im) ./ ħ
-        ψbuf[Nx+1:end] .=  -Tx .* (planF * psi_re) ./ ħ 
-        dψ[1:Nx] .+= real.(planB * ψbuf[1:Nx]) .+ Vx .* (psi_im) ./ ħ  
-        dψ[Nx+1:end] .+= real.(planB * ψbuf[Nx+1:end]) .- Vx .* (psi_re) ./ ħ     
+        ψbuf_r .=  Tx .* (planF * psi_im) ./ ħ
+        ψbuf_i .=  -Tx .* (planF * psi_re) ./ ħ 
+        dψ[1:Nx] .+= (planB * ψbuf_r) .+ Vx .* (psi_im) ./ ħ  
+        dψ[Nx+1:end] .+= (planB * ψbuf_i) .- Vx .* (psi_re) ./ ħ     
     end
 
     function width(ψ, x, dx)
@@ -126,7 +141,7 @@ function main()
         return sqrt(mean_x2 - mean_x^2)
     end
 
-    function rho(ψ, x, dx)
+    function rho_func(ψ, x, dx)
 
         psi_re = @view ψ[1:Nx]
         psi_im = @view ψ[Nx+1:end]
@@ -145,11 +160,11 @@ function main()
 
     ψ0 = coherent1D(x, α0x, σx, ωx, 0.0);
 
-    # prob = SplitODEProblem(decoherence!, schrodinger!, ψ0, tspan);
-    prob = ODEProblem(full_decoherence!, ψ0, tspan);
+    prob = SplitODEProblem(decoherence!, schrodinger!, ψ0, tspan);
+    # prob = ODEProblem(full_decoherence!, ψ0, tspan);
 
-    sol = solve(prob, FBDF(autodiff=AutoFiniteDiff()), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
-    # sol = solve(prob, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
+    # sol = solve(prob, FBDF(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
+    sol = solve(prob, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
     # sol = solve(prob, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
 
     t_vals = tspan[1]:0.1:tspan[2];
