@@ -46,8 +46,8 @@ Base.@kwdef struct Config{T<:AbstractFloat}
     ωx::T                       = 1.0
     ωy::T                       = 1.0
     small::T                    = eps(T)
-    reltol::T                   = eps(T)*1e4
-    abstol::T                   = eps(T)*1e4
+    reltol::T                   = sqrt(eps(T))/10
+    abstol::T                   = sqrt(eps(T))/10
     saveat::T                   = 0.01
     dt::Union{Nothing,T}        = nothing
     krylovdim::Int                    = 20
@@ -229,9 +229,10 @@ wrap_to_pi!(out, x) = (@. out = (mod(x + π, 2π)) - π)
 function decoherence!(du, u, C::SchrCache{T}, t) where T
     p = C.p
     @. C.ρ   = abs2(u)                      # ρ = |ψ|^2
+    # Z = sum(C.ρ)
 
     @. C.lnρ = log(C.ρ + p.small)           # lnρ = log(ρ + ε)
-    μln = sum(@. C.ρ * C.lnρ)           # media ponderada por ρ
+    μln = sum(@. C.ρ * C.lnρ)#/Z           # media ponderada por ρ
 
     @. C.Λ   = 2.0 * angle(u)               # ángulo doble
     s = sum(@. C.ρ * sin(C.Λ))              # suma ponderada de senos
@@ -324,7 +325,8 @@ function build_problem_1d(cfg::Config{T}, to_device, Vfun, ψ0) where T
 
     F_impl  = ODEFunction(f_impl!; jvp=jvp!)
     F_expl  = ODEFunction(f_expl!)
-    prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan, C)
+    # prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan, C)
+    prob    = ODEProblem(F_impl, ψ, cfg.tspan, C)
     return prob, C
 end
 
@@ -373,7 +375,9 @@ function solve_problem(cfg::Config{T}, to_device; Vfun=nothing, ψ0=nothing) whe
 
     # IMEX de orden 5 con linsolve=GMRES (matricial-libre usando tu jvp)
     lins = KrylovJL_GMRES()
+    # lins = QRFactorization()
     alg  = KenCarp58(linsolve=lins)  # sin autodiff; usará jvp
+    # alg  = QNDF(linsolve=lins)  # sin autodiff; usará jvp
 
     common = (reltol=cfg.reltol, abstol=cfg.abstol, saveat=cfg.saveat)
     sol = isnothing(cfg.dt) ? solve(prob, alg; common...) :
@@ -404,7 +408,7 @@ function main(T; kwargs...)
 end
 
 function main_1()
-    T = Float32
+    T = Float64
     p = (
     dims = 1,
     Nx = 1024,
@@ -414,7 +418,7 @@ function main_1()
     α0x = Complex{T}(2.5, 1),
     σx = T(0.0),
     ωx = T(1),
-    tspan = (T(0.0), T(5.0))
+    tspan = (T(0.0), T(2))
     )
 
     sol1, cache1 = main(T; p...)
@@ -424,6 +428,7 @@ function main_1()
     ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
     ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
 
+    println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
 
 
     # 3) Construye la analítica (elige tus α0 y σ)
