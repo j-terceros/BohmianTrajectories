@@ -46,11 +46,14 @@ Base.@kwdef struct Config{T<:AbstractFloat}
     ωx::T                       = 1.0
     ωy::T                       = 1.0
     small::T                    = eps(T)
-    reltol::T                   = sqrt(eps(T))/10
-    abstol::T                   = sqrt(eps(T))/10
+    reltol::T                   = sqrt(eps(T))/100
+    abstol::T                   = sqrt(eps(T))/100
     saveat::T                   = 0.01
     dt::Union{Nothing,T}        = nothing
     krylovdim::Int                    = 20
+    # for progress bar
+    progress::Bool              = true
+    progress_steps::Int         = 100
     # Parámetros del estado coherente y entrelazado
     α0x::Complex{T}                   = 2.5 + 0.0im    # amplitud coherente eje x
     σx::T                       = 0.0            # fase inicial eje x
@@ -251,7 +254,7 @@ end
 # Lo implementamos en GPU. OrdinaryDiffEq lo usará para formar Wv = v - γ Jv en GMRES.
 
 # ND
-function jvp_schrodinger!(Jv::AbstractArray{Complex{T},N}, v::AbstractArray{Complex{T},N}, C::SchrCache1D{T}, t) where {T, N}
+function jvp_schrodinger!(Jv, v, C::SchrCache{T}, t) where T
     schrodinger_impl!(Jv, v, C, t)
     return nothing
 end
@@ -277,7 +280,9 @@ function coherent1D(x::AbstractArray{T,1}, α0::Complex{T}, σ::T, ω::T, t::T) 
     ψ = @. (pref) * (φ) *
               exp(-((x - x̄)^2)/den) *
               cis(p̄ * x)                           # cis(z)=exp(i z), estable y GPU-friendly
-    return Complex{T}.(ψ)                                      # NO normalizamos aquí
+    norm2 = sum(abs2.(ψ))
+    ψ ./= sqrt(norm2)
+    return Complex{T}.(ψ)               
 end
 
 # Estado entrelazado 2D (GPU): solo el término c1 · ψ_rx(x) · ψ_ry(y)
@@ -294,14 +299,17 @@ function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1},
 
     # Construye Ny×Nx = ψ_ry(y) * ψ_rx(x) (outer product con broadcasting)
     # reshape(ψry, Ny,1) .* reshape(ψrx,1,Nx) → Ny×Nx
-    ψ = @. c1 * reshape(ψry, Ny, 1) * reshape(ψrx, 1, Nx)
+    ψ = c1 .* reshape(ψry, Ny, 1) .* reshape(ψrx, 1, Nx)
 
     # Si más adelante activas el segundo término (comentado en tu idea):
     # ψlx = coherent1D_gpu(x, α0x, σx+π, ωx, t)
     # ψly = coherent1D_gpu(y, α0y, σy+π, ωy, t)
     # ψ  += @. c2 * reshape(ψly, Ny, 1) * reshape(ψrx, 1, Nx) # o la combinación que quieras
 
-    return Complex{T}.(ψ)                                      # NO normalizamos aquí
+    norm2 = sum(abs2.(ψ))
+    ψ ./= sqrt(norm2)
+
+    return Complex{T}.(ψ)   
 end
 
 # -------------------- 10) CONSTRUCCIÓN DEL SPLIT PROBLEM (1D / 2D) -----------------------
@@ -331,7 +339,7 @@ function build_problem_1d(cfg::Config{T}, to_device, Vfun, ψ0) where T
 end
 
 function build_problem_2d(cfg::Config{T}, to_device, Vfun, ψ0) where {T}
-    C = make_cache_2d(cfg, to_device; Vfun)
+    C = make_cache_2d(cfg, to_device, Vfun)
     if isnothing(ψ0)
         ψ = entangled_ψ(C.x, C.y,
                             cfg.α0x, cfg.σx, C.p.ωx,
@@ -344,13 +352,20 @@ function build_problem_2d(cfg::Config{T}, to_device, Vfun, ψ0) where {T}
         ψ = complex(T).(ψ0) |> to_device
     end
 
-    f_impl! = (du,u,p,t) -> schrodinger_impl!(du, u, C, t)
-    jvp!    = (Jv,v,u,p,t) -> jvp_schrodinger!(Jv, v, C, t)
-    f_expl! = (du,u,p,t) -> decoherence!(du, u, C, t)
+    function f_impl!(du,u,p,t)
+        schrodinger_impl!(du, u, C, t)
+    end
+    function jvp!(Jv,v,u,p,t)
+        jvp_schrodinger!(reshape(Jv, cfg.Ny, cfg.Ny), reshape(v, cfg.Ny, cfg.Nx), C, t)
+    end
+    function f_expl!(du,u,p,t)
+        decoherence!(du, u, C, t)
+    end
 
     F_impl  = ODEFunction(f_impl!; jvp=jvp!)
     F_expl  = ODEFunction(f_expl!)
-    prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan, C)
+    # prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan, C)
+    prob    = ODEProblem(F_impl, ψ, cfg.tspan, C)
     return prob, C
 end
 
@@ -375,11 +390,10 @@ function solve_problem(cfg::Config{T}, to_device; Vfun=nothing, ψ0=nothing) whe
 
     # IMEX de orden 5 con linsolve=GMRES (matricial-libre usando tu jvp)
     lins = KrylovJL_GMRES()
-    # lins = QRFactorization()
     alg  = KenCarp58(linsolve=lins)  # sin autodiff; usará jvp
-    # alg  = QNDF(linsolve=lins)  # sin autodiff; usará jvp
 
-    common = (reltol=cfg.reltol, abstol=cfg.abstol, saveat=cfg.saveat)
+    common = (reltol=cfg.reltol, abstol=cfg.abstol, saveat=cfg.saveat,
+                progress=cfg.progress, progress_steps=cfg.progress_steps)
     sol = isnothing(cfg.dt) ? solve(prob, alg; common...) :
                               solve(prob, alg; dt=cfg.dt, common...)
 
@@ -396,11 +410,11 @@ Ejemplos:
   sol2, cache2 = main(dims=2, Nx=1024, Ny=1024, Lx=30.0, Ly=30.0, krylovdim=15)
 """
 function main(T; kwargs...)
-    if CUDA.functional()
+    # if CUDA.functional()
         to_device(x::AbstractArray) = CuArray(x)
-    else
-        to_device(x::AbstractArray) = x
-    end
+    # else
+        # to_device(x::AbstractArray) = x
+    # end
     cfg = Config{T}(; kwargs...)
     sol, cache = solve_problem(cfg, to_device)
     @info "Listo. Estados guardados: $(length(sol.t))  |  t_final = $(sol.t[end])"
@@ -415,10 +429,10 @@ function main_1()
     Lx = T(30),
     κ = T(0),
     ν = T(0),
-    α0x = Complex{T}(2.5, 1),
+    α0x = Complex{T}(2.5, 0),
     σx = T(0.0),
     ωx = T(1),
-    tspan = (T(0.0), T(2))
+    tspan = (T(0.0), T(5))
     )
 
     sol1, cache1 = main(T; p...)
@@ -436,6 +450,8 @@ function main_1()
     ψf   = coherent1D(x_cpu, p.α0x, p.σx, p.ωx, t_f)
     ψf_r = real.(ψf)
 
+    println(norm(ψf - ψ_sim))
+
     # 4) Grafica
     fig = Figure()
     ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
@@ -443,4 +459,52 @@ function main_1()
     lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
     axislegend(ax)
     display(fig)
+end
+
+function main_2()
+    T = Float64
+    p = (
+    dims = 2,
+    Nx = 1024,
+    Ny = 1024,
+    Lx = T(30),
+    κ = T(0),
+    ν = T(0),
+    α0x = Complex{T}(2.5, 0),
+    α0y = Complex{T}(2.5, 0),
+    σx = T(0.0),
+    ωx = T(1),
+    σy = T(0.0),
+    ωy = T(1),
+    tspan = (T(0.0), T(5)),
+    c1 = Complex{T}(1),
+    c2 = Complex{T}(0),
+    )
+
+    sol1, cache1 = main(T; p...)
+
+    # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
+    ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
+    ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
+
+    println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
+
+
+    # 3) Construye la analítica (elige tus α0 y σ)
+    t_f = sol1.t[end]     # último tiempo del numérico
+    ψf = entangled_ψ(cache1.x, cache1.y,
+                        p.α0x, p.σx, p.ωx,
+                        p.α0y, p.σy, p.ωy,
+                        t_f, p.c1, p.c2) |> Array
+    ψf_r = real.(ψf)
+
+    println(norm(ψf - ψ_sim))
+
+    # # 4) Grafica
+    # fig = Figure()
+    # ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
+    # lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
+    # lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
+    # axislegend(ax)
+    # display(fig)
 end
