@@ -13,6 +13,7 @@ using OrdinaryDiffEq            # algoritmos IMEX (KenCarp*)
 using LinearSolve               # GMRES (KrylovJL_GMRES) para JFNK
 using FFTW                      # fftfreq (tu forma preferida para k)
 using GLMakie                   # visualización (opcional)
+using NVTX
 
 CUDA.allowscalar(false)         # prohíbe indexado escalar en GPU
 
@@ -327,9 +328,18 @@ function build_problem_1d(cfg::Config{T}, to_device, Vfun, ψ0) where T
         ψ = complex(T).(ψ0) |> to_device
     end
 
-    f_impl! = (du,u,p,t) -> schrodinger_impl!(du, u, C, t)
-    jvp!    = (Jv,v,u,p,t) -> jvp_schrodinger!(Jv, v, C, t)
-    f_expl! = (du,u,p,t) -> decoherence!(du, u, C, t)
+    NVTX.@annotate function f_impl!(du,u,p,t)
+        schrodinger_impl!(du, u, C, t)
+        return nothing
+    end
+    NVTX.@annotate function jvp!(Jv,v,u,p,t)
+        jvp_schrodinger!(Jv, v, C, t)
+        return nothing
+    end
+    NVTX.@annotate function f_expl!(du,u,p,t)
+        decoherence!(du, u, C, t)
+        return nothing
+    end
 
     F_impl  = ODEFunction(f_impl!; jvp=jvp!)
     F_expl  = ODEFunction(f_expl!)
@@ -352,13 +362,13 @@ function build_problem_2d(cfg::Config{T}, to_device, Vfun, ψ0) where {T}
         ψ = complex(T).(ψ0) |> to_device
     end
 
-    function f_impl!(du,u,p,t)
+    NVTX.@annotate function f_impl!(du,u,p,t)
         schrodinger_impl!(du, u, C, t)
     end
-    function jvp!(Jv,v,u,p,t)
+    NVTX.@annotate function jvp!(Jv,v,u,p,t)
         jvp_schrodinger!(reshape(Jv, cfg.Ny, cfg.Ny), reshape(v, cfg.Ny, cfg.Nx), C, t)
     end
-    function f_expl!(du,u,p,t)
+    NVTX.@annotate function f_expl!(du,u,p,t)
         decoherence!(du, u, C, t)
     end
 
@@ -417,7 +427,7 @@ function main(T; kwargs...)
     # end
     cfg = Config{T}(; kwargs...)
     sol, cache = solve_problem(cfg, to_device)
-    @info "Listo. Estados guardados: $(length(sol.t))  |  t_final = $(sol.t[end])"
+    # @info "Listo. Estados guardados: $(length(sol.t))  |  t_final = $(sol.t[end])"
     return sol, cache
 end
 
@@ -432,42 +442,44 @@ function main_1()
     α0x = Complex{T}(2.5, 0),
     σx = T(0.0),
     ωx = T(1),
-    tspan = (T(0.0), T(5))
+    tspan = (T(0.0), T(0.1))
     )
 
     sol1, cache1 = main(T; p...)
 
-    # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
-    x_cpu   = Array(cache1.x)          # cache1 lo devolvió main(...)
-    ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
-    ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
-
-    println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
-
-
-    # 3) Construye la analítica (elige tus α0 y σ)
-    t_f = sol1.t[end]     # último tiempo del numérico
-    ψf   = coherent1D(x_cpu, p.α0x, p.σx, p.ωx, t_f)
-    ψf_r = real.(ψf)
-
-    println(norm(ψf - ψ_sim))
-
-    # 4) Grafica
-    fig = Figure()
-    ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
-    lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
-    lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
-    axislegend(ax)
-    display(fig)
+    # # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
+    # x_cpu   = Array(cache1.x)          # cache1 lo devolvió main(...)
+    # ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
+    # ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
+    #
+    # println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
+    #
+    #
+    # # 3) Construye la analítica (elige tus α0 y σ)
+    # t_f = sol1.t[end]     # último tiempo del numérico
+    # ψf   = coherent1D(x_cpu, p.α0x, p.σx, p.ωx, t_f)
+    # ψf_r = real.(ψf)
+    #
+    # println(norm(ψf - ψ_sim))
+    #
+    # # 4) Grafica
+    # fig = Figure()
+    # ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
+    # lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
+    # lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
+    # axislegend(ax)
+    # display(fig)
+    return nothing
 end
 
 function main_2()
     T = Float64
     p = (
     dims = 2,
-    Nx = 1024,
-    Ny = 1024,
+    Nx = 512,
+    Ny = 512,
     Lx = T(30),
+    Ly = T(30),
     κ = T(0),
     ν = T(0),
     α0x = Complex{T}(2.5, 0),
@@ -476,35 +488,36 @@ function main_2()
     ωx = T(1),
     σy = T(0.0),
     ωy = T(1),
-    tspan = (T(0.0), T(5)),
+    tspan = (T(0.0), T(0.1)),
     c1 = Complex{T}(1),
     c2 = Complex{T}(0),
     )
 
     sol1, cache1 = main(T; p...)
 
-    # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
-    ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
-    ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
-
-    println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
-
-
-    # 3) Construye la analítica (elige tus α0 y σ)
-    t_f = sol1.t[end]     # último tiempo del numérico
-    ψf = entangled_ψ(cache1.x, cache1.y,
-                        p.α0x, p.σx, p.ωx,
-                        p.α0y, p.σy, p.ωy,
-                        t_f, p.c1, p.c2) |> Array
-    ψf_r = real.(ψf)
-
-    println(norm(ψf - ψ_sim))
-
-    # # 4) Grafica
-    # fig = Figure()
-    # ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
-    # lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
-    # lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
-    # axislegend(ax)
-    # display(fig)
+    # # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
+    # ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
+    # ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
+    #
+    # println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
+    #
+    #
+    # # 3) Construye la analítica (elige tus α0 y σ)
+    # t_f = sol1.t[end]     # último tiempo del numérico
+    # ψf = entangled_ψ(cache1.x, cache1.y,
+    #                     p.α0x, p.σx, p.ωx,
+    #                     p.α0y, p.σy, p.ωy,
+    #                     t_f, p.c1, p.c2) |> Array
+    # ψf_r = real.(ψf)
+    #
+    # println(norm(ψf - ψ_sim))
+    #
+    # # # 4) Grafica
+    # # fig = Figure()
+    # # ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
+    # # lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
+    # # lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
+    # # axislegend(ax)
+    # # display(fig)
+    return nothing
 end
