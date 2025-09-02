@@ -8,14 +8,12 @@
 using CUDA                      # CuArray y ejecución en GPU
 using CUDA.CUFFT                # planes FFT en GPU (cuFFT)
 using LinearAlgebra             # norm, etc.
-# using DifferentialEquations     # SplitODEProblem y solve
 using OrdinaryDiffEq            # algoritmos IMEX (KenCarp*)
 using LinearSolve               # GMRES (KrylovJL_GMRES) para JFNK
 using FFTW                      # fftfreq (tu forma preferida para k)
 using GLMakie                   # visualización (opcional)
 using NVTX
-# using SciMLOperators
-# using SciMLBase
+using Sundials
 
 CUDA.allowscalar(false)         # prohíbe indexado escalar en GPU
 
@@ -51,7 +49,7 @@ Base.@kwdef struct Config{T<:AbstractFloat}
     reltol::T                   = sqrt(eps(T))/100
     abstol::T                   = sqrt(eps(T))/100
     saveat::T                   = 0.01
-    dt::Union{Nothing,T}        = nothing
+    dtmax::T                    = 0.001 
     krylovdim::Int                    = 20
     # for progress bar
     progress::Bool              = true
@@ -179,8 +177,8 @@ end
 
 # -------------------- 7) f₂(u) = decoherencia (parte explícita) --------------------
 # ΔΛ envuelto a [-π, π] (evita saltos angulares grandes)
-@inline function wrap_to_pi(out, x, y)
-    mod(x-y + π, 2π) - π
+@inline function wrap_to_pi(x)
+    mod(x + π, 2π) - π
 end
 
 @inline function angle_2(z)
@@ -202,17 +200,17 @@ end
 
 function decoherence!(du, u, C::SchrCache{T,N}, cfg::Config{T}) where {T,N}
     map!(abs2, C.ρ , u)                      # ρ = |ψ|^2
-    # Z = sum(C.ρ)
+    Z = sum(C.ρ)
 
     map!(x->log_s(x, cfg.small), C.lnρ, C.ρ)           # lnρ = log(ρ + ε)
-    μln = mapreduce(*, +, C.ρ, C.lnρ)#/Z           # media ponderada por ρ
+    μln = mapreduce(*, +, C.ρ, C.lnρ)/Z           # media ponderada por ρ
 
     map!(angle_2, C.Λ, u)               # ángulo doble
     s = mapreduce(rho_sin, +, C.ρ, C.Λ) # suma ponderada de senos
     c = mapreduce(rho_cos, +, C.ρ, C.Λ)          # suma ponderada de cosenos
     μΛ = atan(s, c)                          # media circular
 
-    map!(wrap_to_pi, C.ΔΛ, C.Λ, μΛ)     # ΔΛ ∈ [-π, π]
+    map!(x->wrap_to_pi(x-μΛ), C.ΔΛ, C.Λ )     # ΔΛ ∈ [-π, π]
 
     # du = [ -κ(lnρ - <lnρ>) - i*(ν/2)*ΔΛ ] * u
     map!( (x, y, z)-> ( -cfg.κ*(x - μln) - complex(T)(0,1)*(cfg.ν/2)*y ) * z, du, C.lnρ, C.ΔΛ, u)
@@ -250,8 +248,8 @@ function coherent1D(x::AbstractArray{T,1}, α0::Complex{T}, σ::T, ω::T, t::T) 
     ψ = @. (pref) * (φ) *
               exp(-((x - x̄)^2)/den) *
               cis(p̄ * x)                           # cis(z)=exp(i z), estable y GPU-friendly
-    norm2 = sum(abs2.(ψ))
-    ψ ./= sqrt(norm2)
+    # norm2 = sum(abs2.(ψ))
+    # ψ ./= sqrt(norm2)
     return Complex{T}.(ψ)               
 end
 
@@ -276,8 +274,8 @@ function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1},
     # ψly = coherent1D_gpu(y, α0y, σy+π, ωy, t)
     # ψ  += @. c2 * reshape(ψly, Ny, 1) * reshape(ψrx, 1, Nx) # o la combinación que quieras
 
-    norm2 = sum(abs2.(ψ))
-    ψ ./= sqrt(norm2)
+    # norm2 = sum(abs2.(ψ))
+    # ψ ./= sqrt(norm2)
 
     return Complex{T}.(ψ)   
 end
@@ -312,8 +310,8 @@ function build_problem_1d(cfg::Config{T}, to_device, Vfun, ψ0) where T
 
     F_impl  = ODEFunction(f_impl!; jvp=jvp!)
     F_expl  = ODEFunction(f_expl!)
-    # prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan)
-    prob    = ODEProblem(F_impl, ψ, cfg.tspan)
+    prob    = SplitODEProblem(F_expl, F_impl, ψ, cfg.tspan)
+    # prob    = ODEProblem(F_impl, ψ, cfg.tspan)
     return prob, C, x
 end
 
@@ -343,13 +341,13 @@ function build_problem_2d(cfg::Config{T}, to_device, Vfun, ψ0) where {T}
 
     F_impl  = ODEFunction(f_impl!; jvp=jvp!)
     F_expl  = ODEFunction(f_expl!)
-    # prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan)
-    prob    = ODEProblem(F_impl, ψ, cfg.tspan)
+    prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan)
+    # prob    = ODEProblem(F_impl, ψ, cfg.tspan)
     return prob, C, x
 end
 
 
-# -------------------- 12) RESOLVER: KenCarp58 + GMRES (JFNK, sin autodiff) ---------------
+# -------------------- 12) RESOLVER: KenCarp5 + GMRES (JFNK, sin autodiff) ---------------
 function solve_problem(cfg::Config{T}, to_device; Vfun=nothing, ψ0=nothing) where T
     prob, cache, x = if cfg.dims==1
         if isnothing(Vfun)
@@ -369,41 +367,32 @@ function solve_problem(cfg::Config{T}, to_device; Vfun=nothing, ψ0=nothing) whe
 
     # IMEX de orden 5 con linsolve=GMRES (matricial-libre usando tu jvp)
     lins = KrylovJL_GMRES()
-    alg  = KenCarp58(linsolve=lins)  # sin autodiff; usará jvp
+    alg  = KenCarp5(linsolve=lins)  # sin autodiff; usará jvp
+    # alg = ARKODE(Sundials.Implicit(), order=5, linear_solver=:GMRES)
 
     common = (reltol=cfg.reltol, abstol=cfg.abstol, saveat=cfg.saveat,
                 progress=cfg.progress, progress_steps=cfg.progress_steps,
-                dtmax=0.001)
-    sol = isnothing(cfg.dt) ? solve(prob, alg; common...) :
-                              solve(prob, alg; dt=cfg.dt, common...)
+                dtmax=cfg.dtmax)
+    sol = solve(prob, alg; common...) 
 
     return sol, cache, x
 end
 
+function reference_delta_1d(cfg::Config{T}) where T
+    δ0 = [sqrt(1/(2*cfg.ωx)), cfg.κ*sqrt(1/(2*cfg.ωx))];
 
+    prob_δ = ODEProblem(diff_width!, δ0, cfg.tspan, cfg);
 
-# define operators
-function make_operators_1d(cfg::Config{T}; to_device=x->x, Vfun=harmonic_V_1d) where T
-    C, x = make_cache_1d(cfg, to_device, Vfun)
+    sol_δ = solve(prob_δ, reltol=1e-12, abstol=1e-12, saveat = cfg.saveat);
 
-
-    function _schr_op(v, u, p, t)
-        schrodinger_impl!(C.tmp, v, C)
-        return C.tmp
-    end
-
-    function _schr_op(w, v, u, p, t) 
-        schrodinger_impl!(w, v, C)
-    end
-
-    schr_op = FunctionOperator(_schr_op, C.tmp, C.tmp;
-                    T=complex(T), u = C.tmp, p = SciMLBase.NullParameters, 
-                    isconvertible = false,
-                    islinear=true, isconstant=true, ishermitian=true, issymetric=true)
-
-    return schr_op, C, x 
+    return sol_δ
 end
 
+function diff_width!(du, u, p, t)
+    δ, dδ = u
+    du[1] = dδ
+    du[2] = (2*p.κ - p.ν)*dδ + (p.ν*p.κ - p.κ^2)*δ + (p.ħ^2) / (4*p.m^2*δ^3) - δ*p.ωx^2
+end
 
 # -------------------- 13) MAIN para VS Code / REPL / CLI ---------------------------------
 """
@@ -416,9 +405,9 @@ Ejemplos:
 """
 function main(cfg)
     # if CUDA.functional()
-        to_device(x::AbstractArray) = CuArray(x)
+        # to_device(x::AbstractArray) = CuArray(x)
     # else
-        # to_device(x::AbstractArray) = x
+        to_device(x::AbstractArray) = x
     # end
     sol, cache, x = solve_problem(cfg, to_device)
     # @info "Listo. Estados guardados: $(length(sol.t))  |  t_final = $(sol.t[end])"
@@ -431,12 +420,14 @@ function main_1()
         dims = 1,
         N = 1024,
         Lx = T(30),
-        κ = T(0),
-        ν = T(0),
+        κ = T(-1),
+        ν = T(1),
         α0x = Complex{T}(2.5, 0),
         σx = T(0.0),
         ωx = T(1),
-        tspan = (T(0.0), T(10.0)),
+        tspan = (T(0.0), T(1.0)),
+        dtmax = T(0.05),
+        saveat = T(0.01)
     )
 
     cfg = Config{T}(; p...)
@@ -448,7 +439,11 @@ function main_1()
     ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
     ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
 
-    println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
+    n_0 = sum(abs2.(sol1.u[1]))
+    n_e = sum(abs2.(sol1.u[end]))
+    println("norm at beggining ", n_0)
+    println("norm at ending ", n_e)
+    println("change ", (n_0-n_e)/n_0)
 
 
     # 3) Construye la analítica (elige tus α0 y σ)
@@ -456,14 +451,35 @@ function main_1()
     ψf   = coherent1D(x_cpu, p.α0x, p.σx, p.ωx, t_f)
     ψf_r = real.(ψf)
 
-    println(norm(ψf - ψ_sim))
+    println("difference between coherent and result ", norm(abs2.(ψf - ψ_sim))/(norm(abs2.(ψf))))
+
+
+    # calculate delta change
+    sol_δ = reference_delta_1d(cfg)
+    δ_dδ = reduce(vcat, [u' for u in sol_δ.u]);
+    t_steps = length(sol_δ.t);
+    δ_all = zeros(t_steps);
+    for n in 1:t_steps
+        _rho = Array(abs2.(sol1.u[n]))
+        Z = sum(_rho)
+        mean_x = sum(_rho .* x_cpu) / Z
+        mean_x2 = sum(_rho .* x_cpu.^2) / Z
+
+        δ_all[n] = sqrt(mean_x2 - mean_x^2)
+    end
 
     # 4) Grafica
     fig = Figure()
     ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
-    lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
-    lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
+    lines!(ax, x_cpu, ψ_sim_r, label="Simulado", linestyle=:dash)
+    lines!(ax, x_cpu, ψf_r,    label="Analítico")
     axislegend(ax)
+
+    ax1 = Axis(fig[1, 2], xlabel="Time", ylabel="Width")
+    lines!(ax1, sol_δ.t, δ_all, label="Simulated", color=:green, linestyle=:dash)
+    lines!(ax1, sol_δ.t, δ_dδ[:,1], label="Analytical", color=:red)
+    axislegend(ax1)
+
     display(fig)
     return nothing
 end
@@ -516,56 +532,5 @@ function main_2()
     # lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
     # axislegend(ax)
     # display(fig)
-    return nothing
-end
-
-function main_1p()
-    T = Float64;
-    p = (
-        dims = 1,
-        N = 1024,
-        Lx = T(30),
-        κ = T(0),
-        ν = T(0),
-        α0x = Complex{T}(2.5, 0),
-        σx = T(0.0),
-        ωx = T(1),
-        tspan = (T(0.0), T(10.0)),
-        dt = 0.001
-    );
-
-    cfg = Config{T}(; p...);
-
-    schr, cache, x = make_operators_1d(cfg);
-    ψ0   = coherent1D(x, p.α0x, p.σx, p.ωx, p.tspan[1])
-    alg = CG4a(;krylov=true, m=30)
-    # alg = MagnusAdapt4()
-    prob = ODEProblem(schr, ψ0, p.tspan, SciMLBase.NullParameters)
-    common = (reltol=cfg.reltol, abstol=cfg.abstol, saveat=cfg.saveat,
-                progress=cfg.progress, progress_steps=cfg.progress_steps)
-    sol = solve(prob, alg; dt=cfg.dt, common...)
-
-    # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
-    x_cpu   = Array(x)          # cache1 lo devolvió main(...)
-    ψ_sim   = Array(sol.u[end])       # último estado en t = tspan[2]
-    ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
-
-    println(sum(abs2.(sol.u[1])),"   ",sum(abs2.(sol.u[end])))
-
-
-    # 3) Construye la analítica (elige tus α0 y σ)
-    t_f = p.tspan[2]     # último tiempo del numérico
-    ψf   = coherent1D(x_cpu, p.α0x, p.σx, p.ωx, t_f)
-    ψf_r = real.(ψf)
-
-    println(norm(ψf - ψ_sim))
-
-    # 4) Grafica
-    fig = Figure()
-    ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
-    lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
-    lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
-    axislegend(ax)
-    display(fig)
     return nothing
 end
