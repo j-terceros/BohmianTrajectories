@@ -8,12 +8,14 @@
 using CUDA                      # CuArray y ejecución en GPU
 using CUDA.CUFFT                # planes FFT en GPU (cuFFT)
 using LinearAlgebra             # norm, etc.
-using DifferentialEquations     # SplitODEProblem y solve
+# using DifferentialEquations     # SplitODEProblem y solve
 using OrdinaryDiffEq            # algoritmos IMEX (KenCarp*)
 using LinearSolve               # GMRES (KrylovJL_GMRES) para JFNK
 using FFTW                      # fftfreq (tu forma preferida para k)
 using GLMakie                   # visualización (opcional)
 using NVTX
+# using SciMLOperators
+# using SciMLBase
 
 CUDA.allowscalar(false)         # prohíbe indexado escalar en GPU
 
@@ -35,8 +37,7 @@ Config: toda la configuración del problema.
 """
 Base.@kwdef struct Config{T<:AbstractFloat}
     dims::Int                         = 1
-    Nx::Int                           = 1024
-    Ny::Int                           = 1024
+    N::Int                           = 1024
     Lx::T                       = 30.0
     Ly::T                       = 30.0
     tspan::Tuple{T,T}     = (0.0, 5.0)
@@ -64,21 +65,6 @@ Base.@kwdef struct Config{T<:AbstractFloat}
     c2::Complex{T}                    = 0.0 + 0.0im    # (reservado) segundo término si luego lo activas
 end
 
-# empaquetado de parámetros físicos (cómodo para pasar en cache)
-Base.@kwdef struct PhysParams{T} 
-    ħ::T = one(T)
-    m::T = one(T)
-    κ::T = -one(T)
-    ν::T = one(T)
-    ωx::T = one(T)
-    ωy::T = one(T)
-    small::T = eps(T)
-end
-
-phys(cfg::Config{T}) where T = PhysParams{T}(;
-    ħ=cfg.ħ, m=cfg.m, κ=cfg.κ, ν=cfg.ν, ωx=cfg.ωx, ωy=cfg.ωy, small=cfg.small
-)
-
 # -------------------- 2) FRECUENCIAS k CON FFTW.fftfreq (tu preferencia) --------------------
 # Usamos tu forma: k = 2π * fftfreq(N, 1/dx) → rad/m en el orden correcto.
 # Se calcula en CPU (FFTW) y subimos a GPU una sola vez.
@@ -98,155 +84,138 @@ end
 
 # -------------------- 3) POTENCIAL ARMÓNICO (puedes inyectar otro) --------------------
 # 1D: V(x) = 1/2 m ωx^2 x^2
-function harmonic_V_1d(x::AbstractArray{T}, p::PhysParams{T}) where T
-    @. 0.5 * p.m * (p.ωx^2) * x^2
+function harmonic_V_1d(x::AbstractArray{T,1}, cfg::Config{T}) where T
+    @. 0.5 * cfg.m * (cfg.ωx^2) * x^2
 end
 
 # 2D: V(x,y) = 1/2 m (ωx^2 x^2 + ωy^2 y^2)
-function harmonic_V_2d(x::AbstractArray{T,1}, y::AbstractArray{T,1}, p::PhysParams{T}) where T
+function harmonic_V_2d(x::AbstractArray{T,1}, y::AbstractArray{T,1}, cfg::Config{T}) where T
     Nx = length(x); Ny = length(y)
     X2 = reshape(x.^2, 1, Nx)           # 1×Nx (broadcast-friendly)
     Y2 = reshape(y.^2, Ny, 1)           # Ny×1
-    @. 0.5 * p.m * (p.ωx^2 * X2 + p.ωy^2 * Y2)   # Ny×Nx en GPU
+    @. 0.5 * cfg.m * (cfg.ωx^2 * X2 + cfg.ωy^2 * Y2)   # Ny×Nx en GPU
 end
 
 # -------------------- 4) CACHÉS (planes FFT + buffers + constantes) --------------------
-abstract type SchrCache{T} end
+abstract type SchrCache{T,N} end
 
 # 1D
-struct SchrCache1D{T} <: SchrCache{T}
-    p::PhysParams{T}                 # parámetros físicos
-    x::AbstractArray{T,1}                  # malla x
-    kx::AbstractArray{T,1}                 # frecuencias kx
-    V::AbstractArray{T,1}                  # potencial V(x)
-    K2::AbstractArray{T,1}                 # kx.^2
-    tmp::AbstractArray{Complex{T},1}             # buffer real-space
-    ψk::AbstractArray{Complex{T},1}              # buffer k-space
-    ρ::AbstractArray{T,1}                  # densidad |ψ|^2
-    lnρ::AbstractArray{T,1}                # log(ρ+ε)
-    Λ::AbstractArray{T,1}                  # 2*arg(ψ)
-    ΔΛ::AbstractArray{T,1}                 # desviación angular envuelta
-    planF                                   # plan FFT (no anotamos tipo)
-    planB                                   # plan IFFT (no anotamos tipo)
-    cT::T                            # ħ^2/(2m)
-    Lx::T                            # longitud del dominio
-    dx::T                            # paso en x (evita indexado escalar)
+struct SchrCacheND{T,N} <: SchrCache{T,N}
+    V::AbstractArray{Complex{T},N}                  # potencial V(x)
+    K2::AbstractArray{Complex{T},N}                 # kx.^2
+    tmp::AbstractArray{Complex{T},N}             # buffer real-space
+    ψk::AbstractArray{Complex{T},N}              # buffer k-space
+    ρ::AbstractArray{T,N}                  # densidad |ψ|^2
+    lnρ::AbstractArray{T,N}                # log(ρ+ε)
+    Λ::AbstractArray{T,N}                  # 2*arg(ψ)
+    ΔΛ::AbstractArray{T,N}                 # desviación angular envuelta
+    planF::AbstractFFTs.Plan{Complex{T}}   # plan FFT (no anotamos tipo)
+    planB::AbstractFFTs.Plan{Complex{T}}   # plan IFFT (no anotamos tipo)
 end
 
-# 2D
-struct SchrCache2D{T} <: SchrCache{T}
-    p::PhysParams{T}
-    x::AbstractArray{T,1}
-    y::AbstractArray{T,1}
-    kx::AbstractArray{T,1}
-    ky::AbstractArray{T,1}
-    V::AbstractArray{T,2}
-    K2::AbstractArray{T,2}                 # ky.^2 .+ kx.^2 (Ny×Nx)
-    tmp::AbstractArray{Complex{T},2}
-    ψk::AbstractArray{Complex{T},2}
-    ρ::AbstractArray{T,2}
-    lnρ::AbstractArray{T,2}
-    Λ::AbstractArray{T,2}
-    ΔΛ::AbstractArray{T,2}
-    planF
-    planB
-    cT::T
-    Lx::T; Ly::T
-    dx::T; dy::T               # pasos (sin indexar)
-end
 
 # crea cache 1D (potencial inyectable)
 function make_cache_1d(cfg::Config{T}, to_device, Vfun) where T
-    kx, dx = k_from_fftfreq_1d(cfg.Nx, cfg.Lx)
+    kx, dx = k_from_fftfreq_1d(cfg.N, cfg.Lx)
     kx = to_device(kx)
-    x  = collect(range(-cfg.Lx/2, stop=cfg.Lx/2 - dx, length=cfg.Nx)) # CPU
+    x  = collect(range(-cfg.Lx/2, stop=cfg.Lx/2 - dx, length=cfg.N)) # CPU
     x = to_device(x)
-    p      = phys(cfg)
-    V      = Vfun(x, p)
-    K2     = kx.^2
-    tmp    = zeros(complex(T), cfg.Nx) |> to_device
+    V      = Vfun(x, cfg) .* complex(T)(0,-1) / cfg.ħ 
+    K2     = kx.^2 .* complex(T)(0,-1) * cfg.ħ/ (2 * cfg.m)
+    tmp    = zeros(complex(T), cfg.N) |> to_device
     ψk     = similar(tmp)
-    ρ      = zeros(T, cfg.Nx) |> to_device
+    ρ      = zeros(T, cfg.N) |> to_device
     lnρ    = similar(ρ);  Λ = similar(ρ);  ΔΛ = similar(ρ)
     planF  = plan_fft(ψk)                  # cuFFT 1D
     planB  = plan_ifft(ψk)
-    cT     = (p.ħ^2) / (2p.m)
-    SchrCache1D{T}(p, x, kx, V, K2, tmp, ψk, ρ, lnρ, Λ, ΔΛ, planF, planB, cT, cfg.Lx, dx)
+    SchrCacheND{T,1}(V, K2, tmp, ψk, ρ, lnρ, Λ, ΔΛ, planF, planB), x
 end
 
 # crea cache 2D
 function make_cache_2d(cfg::Config{T}, to_device, Vfun) where T
-    kx, ky, dx, dy = k_from_fftfreq_2d(cfg.Nx, cfg.Ny, cfg.Lx, cfg.Ly)
+    kx, ky, dx, dy = k_from_fftfreq_2d(cfg.N, cfg.N, cfg.Lx, cfg.Ly)
     kx = to_device(kx)
     ky = to_device(ky)
-    x = collect(range(-cfg.Lx/2, stop=cfg.Lx/2 - dx, length=cfg.Nx))
-    y = collect(range(-cfg.Ly/2, stop=cfg.Ly/2 - dy, length=cfg.Ny))
+    x = collect(range(-cfg.Lx/2, stop=cfg.Lx/2 - dx, length=cfg.N))
+    y = collect(range(-cfg.Ly/2, stop=cfg.Ly/2 - dy, length=cfg.N))
     x = to_device(x)
     y = to_device(y)
-    p     = phys(cfg)
-    KX2   = reshape(kx.^2, 1, cfg.Nx)      # 1×Nx
-    KY2   = reshape(ky.^2, cfg.Ny, 1)      # Ny×1
-    K2    = @. KY2 + KX2                   # Ny×Nx
-    V     = Vfun(x, y, p)
-    tmp   = zeros(complex(T), cfg.Ny, cfg.Nx) |> to_device
+    KX2   = reshape(kx.^2, 1, cfg.N)      # 1×Nx
+    KY2   = reshape(ky.^2, cfg.N, 1)      # Ny×1
+    K2    = @. (KY2 + KX2) * complex(T)(0,-1) * cfg.ħ/ (2 * cfg.m)   # Ny×Nx
+    V     = Vfun(x, y, cfg) .* complex(T)(0,-1) / cfg.ħ # Ny×Nx
+    tmp   = zeros(complex(T), cfg.N, cfg.N) |> to_device
     ψk    = similar(tmp)
-    ρ     = zeros(T, cfg.Ny, cfg.Nx) |> to_device
+    ρ     = zeros(T, cfg.N, cfg.N) |> to_device
     lnρ   = similar(ρ);  Λ = similar(ρ);  ΔΛ = similar(ρ)
     planF = plan_fft(ψk)                   # cuFFT 2D
     planB = plan_ifft(ψk)
-    cT    = (p.ħ^2) / (2p.m)
-    SchrCache2D{T}(p, x, y, kx, ky, V, K2, tmp, ψk, ρ, lnρ, Λ, ΔΛ, planF, planB, cT, cfg.Lx, cfg.Ly, dx, dy)
+    SchrCacheND{T,2}(V, K2, tmp, ψk, ρ, lnρ, Λ, ΔΛ, planF, planB), [x, y]
 end
 
-# -------------------- 5) OPERADOR H (T + V) EN GPU, vía FFT --------------------
-# Tψ = ℱ⁻¹( (ħ²/2m) K² .* ℱ(ψ) ); Vψ = V .* ψ.  cuFFT no normaliza → multiplicamos por invN.
 
-# ND
-function Hmul!(y, v, C::SchrCache{T}) where T
+# -------------------- 6) f₁(u) = -(i/ħ) H u  (parte implícita, lineal) --------------------
+# Única función que sirve para 1D y 2D: el múltiple dispatch de Hmul! resuelve.
+
+function schrodinger_impl!(du, u, C::SchrCache{T,N}) where {T,N}
     # FFT out-of-place: ψk = FFT(v)
-    mul!(C.ψk, C.planF, v)
+    mul!(C.ψk, C.planF, u)
 
     # aplica cinética en k: ψk .= cT * K2 .* ψk
-    @. C.ψk = C.cT * C.K2 * C.ψk
+    map!(*, C.ψk, C.ψk, C.K2)
 
     # IFFT out-of-place: tmp = IFFT(ψk)
     mul!(C.tmp, C.planB, C.ψk)
     #@. C.tmp = C.invN * C.tmp  # normaliza (cuFFT no normaliza)
 
     # y = T v + V v
-    @. y = C.tmp + C.V * v
+    map!(ax_y, du, C.V, u, C.tmp)
     return nothing
 end
 
-# -------------------- 6) f₁(u) = -(i/ħ) H u  (parte implícita, lineal) --------------------
-# Única función que sirve para 1D y 2D: el múltiple dispatch de Hmul! resuelve.
-function schrodinger_impl!(du, u, C::SchrCache{T}, t) where T
-    Hmul!(du, u, C)                              # du := H u
-    @. du = complex(T)( 0, -1) / C.p.ħ * du       # du := -(i/ħ) du
-    return nothing
+@inline function ax_y(a, x, y)
+    a*x+y
 end
 
 # -------------------- 7) f₂(u) = decoherencia (parte explícita) --------------------
 # ΔΛ envuelto a [-π, π] (evita saltos angulares grandes)
-wrap_to_pi!(out, x) = (@. out = (mod(x + π, 2π)) - π)
+@inline function wrap_to_pi(out, x, y)
+    mod(x-y + π, 2π) - π
+end
 
-function decoherence!(du, u, C::SchrCache{T}, t) where T
-    p = C.p
-    @. C.ρ   = abs2(u)                      # ρ = |ψ|^2
+@inline function angle_2(z)
+    2*angle(z)
+end
+
+@inline function rho_sin(rho, x)
+    rho*sin(x)
+end
+
+@inline function rho_cos(rho, x)
+    rho*cos(x)
+end
+
+@inline function log_s(rho, s)
+    log(rho + s)
+end
+
+
+function decoherence!(du, u, C::SchrCache{T,N}, cfg::Config{T}) where {T,N}
+    map!(abs2, C.ρ , u)                      # ρ = |ψ|^2
     # Z = sum(C.ρ)
 
-    @. C.lnρ = log(C.ρ + p.small)           # lnρ = log(ρ + ε)
-    μln = sum(@. C.ρ * C.lnρ)#/Z           # media ponderada por ρ
+    map!(x->log_s(x, cfg.small), C.lnρ, C.ρ)           # lnρ = log(ρ + ε)
+    μln = mapreduce(*, +, C.ρ, C.lnρ)#/Z           # media ponderada por ρ
 
-    @. C.Λ   = 2.0 * angle(u)               # ángulo doble
-    s = sum(@. C.ρ * sin(C.Λ))              # suma ponderada de senos
-    c = sum(@. C.ρ * cos(C.Λ))              # suma ponderada de cosenos
+    map!(angle_2, C.Λ, u)               # ángulo doble
+    s = mapreduce(rho_sin, +, C.ρ, C.Λ) # suma ponderada de senos
+    c = mapreduce(rho_cos, +, C.ρ, C.Λ)          # suma ponderada de cosenos
     μΛ = atan(s, c)                          # media circular
 
-    wrap_to_pi!(C.ΔΛ, @. C.Λ - μΛ)          # ΔΛ ∈ [-π, π]
+    map!(wrap_to_pi, C.ΔΛ, C.Λ, μΛ)     # ΔΛ ∈ [-π, π]
 
     # du = [ -κ(lnρ - <lnρ>) - i*(ν/2)*ΔΛ ] * u
-    @. du = ( -p.κ*(C.lnρ - μln) - complex(T)(0,1)*(p.ν/2)*C.ΔΛ ) * u
+    map!( (x, y, z)-> ( -cfg.κ*(x - μln) - complex(T)(0,1)*(cfg.ν/2)*y ) * z, du, C.lnρ, C.ΔΛ, u)
     return nothing
 end
 
@@ -255,8 +224,8 @@ end
 # Lo implementamos en GPU. OrdinaryDiffEq lo usará para formar Wv = v - γ Jv en GMRES.
 
 # ND
-function jvp_schrodinger!(Jv, v, C::SchrCache{T}, t) where T
-    schrodinger_impl!(Jv, v, C, t)
+function jvp_schrodinger!(Jv, v, C::SchrCache{T,N}) where {T,N}
+    schrodinger_impl!(Jv, v, C)
     return nothing
 end
 
@@ -317,10 +286,10 @@ end
 # Nota: ODEFunction con keyword :jvp (NO Wmul/Wfact). Esto evita autodiff en GPU.
 
 function build_problem_1d(cfg::Config{T}, to_device, Vfun, ψ0) where T
-    C = make_cache_1d(cfg, to_device, Vfun)
+    C, x = make_cache_1d(cfg, to_device, Vfun)
     # Estado inicial:
     if isnothing(ψ0)
-        ψ = coherent1D(C.x, cfg.α0x, cfg.σx, C.p.ωx, cfg.tspan[1])     # t0
+        ψ = coherent1D(x, cfg.α0x, cfg.σx, cfg.ωx, cfg.tspan[1])     # t0
         # Normalización discreta: ∑ |ψ|^2 = 1
         # norm2 = sum(abs2.(ψ))
         # ψ ./= sqrt(norm2)
@@ -329,31 +298,31 @@ function build_problem_1d(cfg::Config{T}, to_device, Vfun, ψ0) where T
     end
 
     NVTX.@annotate function f_impl!(du,u,p,t)
-        schrodinger_impl!(du, u, C, t)
+        schrodinger_impl!(du, u, C)
         return nothing
     end
     NVTX.@annotate function jvp!(Jv,v,u,p,t)
-        jvp_schrodinger!(Jv, v, C, t)
+        jvp_schrodinger!(Jv, v, C)
         return nothing
     end
     NVTX.@annotate function f_expl!(du,u,p,t)
-        decoherence!(du, u, C, t)
+        decoherence!(du, u, C, cfg)
         return nothing
     end
 
     F_impl  = ODEFunction(f_impl!; jvp=jvp!)
     F_expl  = ODEFunction(f_expl!)
-    # prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan, C)
-    prob    = ODEProblem(F_impl, ψ, cfg.tspan, C)
-    return prob, C
+    # prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan)
+    prob    = ODEProblem(F_impl, ψ, cfg.tspan)
+    return prob, C, x
 end
 
 function build_problem_2d(cfg::Config{T}, to_device, Vfun, ψ0) where {T}
-    C = make_cache_2d(cfg, to_device, Vfun)
+    C, x= make_cache_2d(cfg, to_device, Vfun)
     if isnothing(ψ0)
-        ψ = entangled_ψ(C.x, C.y,
-                            cfg.α0x, cfg.σx, C.p.ωx,
-                            cfg.α0y, cfg.σy, C.p.ωy,
+        ψ = entangled_ψ(x[1], x[2],
+                            cfg.α0x, cfg.σx, cfg.ωx,
+                            cfg.α0y, cfg.σy, cfg.ωy,
                             cfg.tspan[1], cfg.c1, cfg.c2)
         # Normalización discreta 2D: ∑ |ψ|^2 = 1
         # norm2 = sum(abs2.(ψ))
@@ -363,26 +332,26 @@ function build_problem_2d(cfg::Config{T}, to_device, Vfun, ψ0) where {T}
     end
 
     NVTX.@annotate function f_impl!(du,u,p,t)
-        schrodinger_impl!(du, u, C, t)
+        schrodinger_impl!(du, u, C)
     end
     NVTX.@annotate function jvp!(Jv,v,u,p,t)
-        jvp_schrodinger!(reshape(Jv, cfg.Ny, cfg.Ny), reshape(v, cfg.Ny, cfg.Nx), C, t)
+        jvp_schrodinger!(reshape(Jv, cfg.N, cfg.N), reshape(v, cfg.N, cfg.N), C)
     end
     NVTX.@annotate function f_expl!(du,u,p,t)
-        decoherence!(du, u, C, t)
+        decoherence!(du, u, C, cfg)
     end
 
     F_impl  = ODEFunction(f_impl!; jvp=jvp!)
     F_expl  = ODEFunction(f_expl!)
-    # prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan, C)
-    prob    = ODEProblem(F_impl, ψ, cfg.tspan, C)
-    return prob, C
+    # prob    = SplitODEProblem(F_impl, F_expl, ψ, cfg.tspan)
+    prob    = ODEProblem(F_impl, ψ, cfg.tspan)
+    return prob, C, x
 end
 
 
 # -------------------- 12) RESOLVER: KenCarp58 + GMRES (JFNK, sin autodiff) ---------------
 function solve_problem(cfg::Config{T}, to_device; Vfun=nothing, ψ0=nothing) where T
-    prob, cache = if cfg.dims==1
+    prob, cache, x = if cfg.dims==1
         if isnothing(Vfun)
             build_problem_1d(cfg, to_device, harmonic_V_1d, ψ0)
         else
@@ -403,12 +372,38 @@ function solve_problem(cfg::Config{T}, to_device; Vfun=nothing, ψ0=nothing) whe
     alg  = KenCarp58(linsolve=lins)  # sin autodiff; usará jvp
 
     common = (reltol=cfg.reltol, abstol=cfg.abstol, saveat=cfg.saveat,
-                progress=cfg.progress, progress_steps=cfg.progress_steps)
+                progress=cfg.progress, progress_steps=cfg.progress_steps,
+                dtmax=0.001)
     sol = isnothing(cfg.dt) ? solve(prob, alg; common...) :
                               solve(prob, alg; dt=cfg.dt, common...)
 
-    return sol, cache
+    return sol, cache, x
 end
+
+
+
+# define operators
+function make_operators_1d(cfg::Config{T}; to_device=x->x, Vfun=harmonic_V_1d) where T
+    C, x = make_cache_1d(cfg, to_device, Vfun)
+
+
+    function _schr_op(v, u, p, t)
+        schrodinger_impl!(C.tmp, v, C)
+        return C.tmp
+    end
+
+    function _schr_op(w, v, u, p, t) 
+        schrodinger_impl!(w, v, C)
+    end
+
+    schr_op = FunctionOperator(_schr_op, C.tmp, C.tmp;
+                    T=complex(T), u = C.tmp, p = SciMLBase.NullParameters, 
+                    isconvertible = false,
+                    islinear=true, isconstant=true, ishermitian=true, issymetric=true)
+
+    return schr_op, C, x 
+end
+
 
 # -------------------- 13) MAIN para VS Code / REPL / CLI ---------------------------------
 """
@@ -419,50 +414,102 @@ Ejemplos:
 
   sol2, cache2 = main(dims=2, Nx=1024, Ny=1024, Lx=30.0, Ly=30.0, krylovdim=15)
 """
-function main(T; kwargs...)
+function main(cfg)
     # if CUDA.functional()
         to_device(x::AbstractArray) = CuArray(x)
     # else
         # to_device(x::AbstractArray) = x
     # end
-    cfg = Config{T}(; kwargs...)
-    sol, cache = solve_problem(cfg, to_device)
+    sol, cache, x = solve_problem(cfg, to_device)
     # @info "Listo. Estados guardados: $(length(sol.t))  |  t_final = $(sol.t[end])"
-    return sol, cache
+    return sol, cache, x
 end
 
 function main_1()
     T = Float64
     p = (
-    dims = 1,
-    Nx = 1024,
-    Lx = T(30),
-    κ = T(0),
-    ν = T(0),
-    α0x = Complex{T}(2.5, 0),
-    σx = T(0.0),
-    ωx = T(1),
-    tspan = (T(0.0), T(0.1))
+        dims = 1,
+        N = 1024,
+        Lx = T(30),
+        κ = T(0),
+        ν = T(0),
+        α0x = Complex{T}(2.5, 0),
+        σx = T(0.0),
+        ωx = T(1),
+        tspan = (T(0.0), T(10.0)),
     )
 
-    sol1, cache1 = main(T; p...)
+    cfg = Config{T}(; p...)
 
-    # # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
-    # x_cpu   = Array(cache1.x)          # cache1 lo devolvió main(...)
-    # ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
-    # ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
-    #
-    # println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
-    #
-    #
-    # # 3) Construye la analítica (elige tus α0 y σ)
-    # t_f = sol1.t[end]     # último tiempo del numérico
-    # ψf   = coherent1D(x_cpu, p.α0x, p.σx, p.ωx, t_f)
-    # ψf_r = real.(ψf)
-    #
-    # println(norm(ψf - ψ_sim))
-    #
-    # # 4) Grafica
+    sol1, cache1, x = main(cfg)
+
+    # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
+    x_cpu   = Array(x)          # cache1 lo devolvió main(...)
+    ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
+    ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
+
+    println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
+
+
+    # 3) Construye la analítica (elige tus α0 y σ)
+    t_f = sol1.t[end]     # último tiempo del numérico
+    ψf   = coherent1D(x_cpu, p.α0x, p.σx, p.ωx, t_f)
+    ψf_r = real.(ψf)
+
+    println(norm(ψf - ψ_sim))
+
+    # 4) Grafica
+    fig = Figure()
+    ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
+    lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
+    lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
+    axislegend(ax)
+    display(fig)
+    return nothing
+end
+
+function main_2()
+    T = Float64
+    p = (
+        dims = 2,
+        N = 512,
+        Lx = T(30),
+        Ly = T(30),
+        κ = T(0),
+        ν = T(0),
+        α0x = Complex{T}(2.5, 0),
+        α0y = Complex{T}(2.5, 0),
+        σx = T(0.0),
+        ωx = T(1),
+        σy = T(0.0),
+        ωy = T(1),
+        tspan = (T(0.0), T(10.0)),
+        c1 = Complex{T}(1),
+        c2 = Complex{T}(0),
+    )
+
+    cfg = Config{T}(; p...)
+
+    sol1, cache1, x = main(cfg)
+
+    # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
+    ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
+    ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
+
+    println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
+
+
+    # 3) Construye la analítica (elige tus α0 y σ)
+    t_f = sol1.t[end]     # último tiempo del numérico
+    ψf = entangled_ψ(x[1], x[2],
+                        p.α0x, p.σx, p.ωx,
+                        p.α0y, p.σy, p.ωy,
+                        t_f, p.c1, p.c2) |> Array
+    ψf_r = real.(ψf)
+
+    println(norm(ψf - ψ_sim))
+
+    # 4) Grafica
     # fig = Figure()
     # ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
     # lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
@@ -472,52 +519,53 @@ function main_1()
     return nothing
 end
 
-function main_2()
-    T = Float64
+function main_1p()
+    T = Float64;
     p = (
-    dims = 2,
-    Nx = 512,
-    Ny = 512,
-    Lx = T(30),
-    Ly = T(30),
-    κ = T(0),
-    ν = T(0),
-    α0x = Complex{T}(2.5, 0),
-    α0y = Complex{T}(2.5, 0),
-    σx = T(0.0),
-    ωx = T(1),
-    σy = T(0.0),
-    ωy = T(1),
-    tspan = (T(0.0), T(0.1)),
-    c1 = Complex{T}(1),
-    c2 = Complex{T}(0),
-    )
+        dims = 1,
+        N = 1024,
+        Lx = T(30),
+        κ = T(0),
+        ν = T(0),
+        α0x = Complex{T}(2.5, 0),
+        σx = T(0.0),
+        ωx = T(1),
+        tspan = (T(0.0), T(10.0)),
+        dt = 0.001
+    );
 
-    sol1, cache1 = main(T; p...)
+    cfg = Config{T}(; p...);
 
-    # # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
-    # ψ_sim   = Array(sol1.u[end])       # último estado en t = tspan[2]
-    # ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
-    #
-    # println(sum(abs2.(sol1.u[1])),"   ",sum(abs2.(sol1.u[end])))
-    #
-    #
-    # # 3) Construye la analítica (elige tus α0 y σ)
-    # t_f = sol1.t[end]     # último tiempo del numérico
-    # ψf = entangled_ψ(cache1.x, cache1.y,
-    #                     p.α0x, p.σx, p.ωx,
-    #                     p.α0y, p.σy, p.ωy,
-    #                     t_f, p.c1, p.c2) |> Array
-    # ψf_r = real.(ψf)
-    #
-    # println(norm(ψf - ψ_sim))
-    #
-    # # # 4) Grafica
-    # # fig = Figure()
-    # # ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
-    # # lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
-    # # lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
-    # # axislegend(ax)
-    # # display(fig)
+    schr, cache, x = make_operators_1d(cfg);
+    ψ0   = coherent1D(x, p.α0x, p.σx, p.ωx, p.tspan[1])
+    alg = CG4a(;krylov=true, m=30)
+    # alg = MagnusAdapt4()
+    prob = ODEProblem(schr, ψ0, p.tspan, SciMLBase.NullParameters)
+    common = (reltol=cfg.reltol, abstol=cfg.abstol, saveat=cfg.saveat,
+                progress=cfg.progress, progress_steps=cfg.progress_steps)
+    sol = solve(prob, alg; dt=cfg.dt, common...)
+
+    # 1) Toma x y ψ_sim del resultado, y pásalos a CPU
+    x_cpu   = Array(x)          # cache1 lo devolvió main(...)
+    ψ_sim   = Array(sol.u[end])       # último estado en t = tspan[2]
+    ψ_sim_r = real.(ψ_sim)             # parte real (o usa abs.(ψ_sim) si quieres módulo)
+
+    println(sum(abs2.(sol.u[1])),"   ",sum(abs2.(sol.u[end])))
+
+
+    # 3) Construye la analítica (elige tus α0 y σ)
+    t_f = p.tspan[2]     # último tiempo del numérico
+    ψf   = coherent1D(x_cpu, p.α0x, p.σx, p.ωx, t_f)
+    ψf_r = real.(ψf)
+
+    println(norm(ψf - ψ_sim))
+
+    # 4) Grafica
+    fig = Figure()
+    ax  = Axis(fig[1,1], xlabel="x", ylabel="Re ψ(x)")
+    lines!(ax, x_cpu, ψ_sim_r, label="Simulado (GPU)", linestyle=:dash)
+    lines!(ax, x_cpu, ψf_r,    label="Analítico (coherente)")
+    axislegend(ax)
+    display(fig)
     return nothing
 end
