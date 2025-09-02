@@ -1,13 +1,15 @@
 using DifferentialEquations
 using FFTW
 using GLMakie
+using Sundials
+using LinearSolve
 
 const ħ = 1.0
 const m = 1.0
 
 function main()
     Nx = 1024
-    Lx = 30.0
+    Lx = 40.0
     dx = Lx / Nx
     x = collect(range(-Lx/2, stop=Lx/2 - dx, length=Nx));
     kx  = 2π .* fftfreq(Nx, 1/dx);
@@ -18,7 +20,7 @@ function main()
     ωx  = 1.0;
     κ   = -1.0;
     ν   = 1.0;
-    small = 1e-30;
+    small = eps();
 
     p = (ħ, m, κ, ν, ωx);
 
@@ -36,7 +38,7 @@ function main()
     # ψbuf_i  = similar(ψbuf_r);
     # planB = plan_irfft(ψbuf_r, Nx);
     # kx = kx[1:length(ψbuf_r)];
-    
+
 
     Vx = 0.5 * m * ωx^2 .* (x.^2);
     Tx = 0.5 * ħ^2 / m .* (kx.^2 );
@@ -72,6 +74,10 @@ function main()
     function schrodinger!(dψ, ψ, p, t)
         psi_re = @view ψ[1:Nx]
         psi_im = @view ψ[Nx+1:end]
+        # ψbuf_r .=  Tx .* (planF * psi_im) ./ ħ
+        # ψbuf_i .=  -Tx .* (planF * psi_re) ./ ħ 
+        # dψ[1:Nx] .= (planB * ψbuf_r) .+ Vx .* (psi_im) ./ ħ  
+        # dψ[Nx+1:end] .= (planB * ψbuf_i) .- Vx .* (psi_re) ./ ħ     
         ψbuf[1:Nx] .=  Tx .* (planF * psi_im) ./ ħ
         ψbuf[Nx+1:end] .=  -Tx .* (planF * psi_re) ./ ħ 
         dψ[1:Nx] .= real.(planB * ψbuf[1:Nx]) .+ Vx .* (psi_im) ./ ħ  
@@ -160,14 +166,35 @@ function main()
 
     ψ0 = coherent1D(x, α0x, σx, ωx, 0.0);
 
-    prob = SplitODEProblem(decoherence!, schrodinger!, ψ0, tspan);
+    common =(
+        reltol = 1e-7,
+        abstol = 1e-10,
+        saveat = 0.01,
+        dtmax = 0.005,
+        maxiters=Int(1e6),
+    )
+
+    # prob = SplitODEProblem(decoherence!, schrodinger!, ψ0, tspan);
+    # prob = SplitODEProblem(schrodinger!, decoherence!, ψ0, tspan);
+    # sol = solve(prob, KenCarp4(linsolve=KrylovJL_GMRES()); common...)
+    # sol = solve(prob, KenCarp5(); common...)
+
+    prob = SplitODEProblem(decoherence!, schrodinger!, ψ0, tspan); #Too slow
+    # prob = SplitODEProblem(schrodinger!, decoherence!, ψ0, tspan); has error but not too much
+    alg = ARKODE(Sundials.Implicit(), order=5, linear_solver=:GMRES)
+    sol = solve(prob, alg; common...)
+
     # prob = ODEProblem(full_decoherence!, ψ0, tspan);
+    # alg = CVODE_BDF(linear_solver=:GMRES, stability_limit_detect=true); error grows a lot
+    # sol = solve(prob, alg; common...)
 
-    # sol = solve(prob, FBDF(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
-    sol = solve(prob, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
-    # sol = solve(prob, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01, dtmax=0.05);
 
-    t_vals = tspan[1]:0.1:tspan[2];
+    n_0 = sum((sol.u[1][1:Nx].^2 .+ sol.u[1][Nx+1:end].^2))
+    n_e = sum((sol.u[end][1:Nx].^2 .+ sol.u[end][Nx+1:end].^2))
+    println("norm at beggining ", n_0)
+    println("norm at ending ", n_e)
+    println("change ", (n_0-n_e)/n_0)
+
 
     ψf = coherent1D(x, α0x, σx, ωx, tspan[2]);
 
@@ -177,14 +204,13 @@ function main()
 
     prob_δ = ODEProblem(diff_width, δ0, tspan, p);
 
-    sol_δ = solve(prob_δ, KenCarp47(), reltol=1e-12, abstol=1e-12; saveat = 0.01);
+    sol_δ = solve(prob_δ, reltol=1e-12, abstol=1e-12; saveat = 0.01);
 
     δ_dδ = reduce(vcat, [u' for u in sol_δ.u]);
 
     t_steps = length(sol_δ.t);
 
     δ_all = zeros(t_steps);
-
     for n in 1:t_steps
         δ_all[n] = width(sol.u[n], x, dx)
     end
@@ -205,5 +231,6 @@ function main()
         return fig
     end
     fig = ploting_result();
-    return display(fig)
+    display(fig)
+    return fig
 end
