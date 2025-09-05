@@ -1,5 +1,5 @@
-using OrdinaryDiffEq
-using GLMakie
+# using OrdinaryDiffEq
+# using GLMakie
 ############################
 # configuration parameters #
 ############################
@@ -31,8 +31,6 @@ Base.@kwdef struct Config{T<:AbstractFloat}
     c1::Complex{T}                    = 1.0 + 0.0im    # coeficiente del término activo en 2D
     c2::Complex{T}                    = 0.0 + 0.0im    # (reservado) segundo término si luego lo activas
 end
-
-
 
 ######################
 # Initial conditions #
@@ -68,7 +66,7 @@ function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1}, t, cfg::Conf
     cfg.α0x, cfg.σx, cfg.ωx,
     cfg.α0y, cfg.σy, cfg.ωy,
     t, cfg.c1, cfg.c2;
-    renorm = renorm, entang = enang) where T
+    renorm = renorm, entang = entang) where T
 end
 
 function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1},
@@ -82,13 +80,13 @@ function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1},
 
     Nx = length(x); Ny = length(y)
 
-    # Construye Ny×Nx = ψ_ry(y) * ψ_rx(x) (outer product con broadcasting)
-    ψ = c1 .* reshape(ψry, Ny, 1) .* reshape(ψrx, 1, Nx)
+    # Construye Nx×Ny = ψ_rx(x) * ψ_ry(y) (outer product con broadcasting)
+    ψ = c1 .* reshape(ψrx, Nx, 1) .* reshape(ψry, 1, Ny)
 
     if entang
         ψlx = coherent1D(x, α0x, σx+π, ωx, t)
         ψly = coherent1D(y, α0y, σy+π, ωy, t)
-        ψ  += @. c2 * reshape(ψly, Ny, 1) * reshape(ψrx, 1, Nx) # o la combinación que quieras
+        ψ  += @. c2 * reshape(ψlx, Nx, 1) * reshape(ψry, 1, Ny) # o la combinación que quieras
     end
     
     if renorm
@@ -121,45 +119,67 @@ end
 ##################
 # utils with psi #
 ##################
-function convert_psi_to_real(ψ::AbstractArray{Complex{T},N}) where {T,N}
-    vcat(real(ψ), imag(ψ))
+
+function convert_psi_to_real!(psi::AbstractArray{T,N}, ψ::AbstractArray{Complex{T},M}) where {T<:AbstractFloat, N, M}
+    @assert N == M+1
+    @assert size(psi)[2:end] == size(ψ) "wrong sizes on psi and ψ"  
+    @assert size(psi)[1] == 2
+    r_arr, i_arr = eachslice(psi, dims=1)
+    map!(real, r_arr, ψ)
+    map!(imag, i_arr, ψ)
+    return nothing
 end
 
-function convert_psi_to_complex(ψ::AbstractArray{T,1}) where {T<:AbstractFloat}
-    Nx = length(ψ)
-    psi_re = @view ψ[1:Nx]
-    psi_im = @view ψ[Nx+1:end]
-    return psi_re + im*psi_im
+function convert_psi_to_real(ψ::AbstractArray{Complex{T},M}) where {T<:AbstractFloat, M}
+    psi = zeros(T, 2, size(ψ)...)
+    convert_psi_to_real!(psi, ψ)
+    return psi
 end
 
-function convert_psi_to_complex(ψ::AbstractArray{T,2}) where {T<:AbstractFloat}
-    Nx = size(ψ,1)
-    psi_re = @view ψ[1:Nx,:]
-    psi_im = @view ψ[Nx+1:end,:]
-    return psi_re + im*psi_im
+function convert_psi_to_complex!(psi::AbstractArray{Complex{T},M}, ψ::AbstractArray{T,N}) where {T<:AbstractFloat, N, M}
+    @assert N == M+1
+    @assert size(ψ)[2:end] == size(psi) "wrong sizes on psi and ψ"  
+    @assert size(ψ)[1] == 2
+    r_arr, i_arr = eachslice(ψ, dims=1)
+    map!((x,y)->x+im*y, psi, r_arr, i_arr)
+    return nothing
 end
 
-function prob_psi(ψ::AbstractArray{T,1}) where{T<:AbstractFloat}
-    Nx = length(ψ)
-    psi_re = @view ψ[1:Nx]
-    psi_im = @view ψ[Nx+1:end]
-
-    return psi_re.^2 .+ psi_im.^2
+function convert_psi_to_complex(ψ::AbstractArray{T,N}) where {T<:AbstractFloat, N}
+    n = size(ψ)[2:end]
+    psi = zeros(Complex{T}, n...)
+    convert_psi_to_complex!(psi, ψ)
+    return psi
 end
 
-function prob_psi(ψ::AbstractArray{T,2}) where{T<:AbstractFloat}
-    Nx = size(ψ,1)
-    psi_re = @view ψ[1:Nx, :]
-    psi_im = @view ψ[Nx+1:end, :]
-
-    return psi_re.^2 .+ psi_im.^2
+function prob_psi!(prob::AbstractArray{T,M}, ψ::AbstractArray{T,N}) where{T<:AbstractFloat, N, M}
+    @assert N == M+1
+    @assert size(ψ)[2:end] == size(prob) "wrong sizes on psi and ψ"  
+    @assert size(ψ)[1] == 2
+    r_arr, i_arr = eachslice(ψ, dims=1)
+    map!((x,y)-> x^2 +y^2, prob, r_arr, i_arr)
+    return nothing
 end
 
-function prob_psi(ψ::AbstractArray{Complex{T},N}) where where{T,N}
-    prob = abs2.(ψ)
+function prob_psi(ψ::AbstractArray{T,N}) where{T<:AbstractFloat, N}
+    n = size(ψ)[2:end]
+    rho = zeros(T,n...)
+    prob_psi!(rho, ψ)
+    return rho
 end
 
-function width(ψ::AbstractArray{T,1}, x) where{T<:AbstractFloat}
+function prob_psi!(prob::AbstractArray{T,N}, ψ::AbstractArray{Complex{T},N}) where{T<:AbstractFloat,N}
+    @assert size(prob) == size(ψ) "wrong size on prob and ψ"
+    map!(abs2, prob, ψ)
+end
+
+function prob_psi(ψ::AbstractArray{Complex{T},N}) where {T<:AbstractFloat,N}
+    prob = zeros(T, size(ψ)...)
+    prob_psi!(prob, ψ)
+    return prob
+end
+
+function width(ψ::AbstractArray{T,1}, x) where{T}
     prob = prob_psi(ψ)
 
     Z = sum(prob)
@@ -175,7 +195,7 @@ end
 #################### 
 # plotting results #
 #################### 
-function plot_1D_comparision(sol_psi, x_cpu)
+function plot_1D_comparision(sol_psi, x_cpu, cfg::Config{T}) where {T}
     sol_δ = reference_delta_1d(cfg)
     δ_dδ = reduce(vcat, [u' for u in sol_δ.u]);
     t_steps = length(sol_δ.t);
