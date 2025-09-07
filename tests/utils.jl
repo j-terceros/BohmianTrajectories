@@ -1,5 +1,8 @@
 # using OrdinaryDiffEq
 # using GLMakie
+using FFTW
+using LinearAlgebra
+
 ############################
 # configuration parameters #
 ############################
@@ -57,7 +60,7 @@ function coherent1D(x::AbstractArray{T,1}, α0::Complex{T}, σ::T, ω::T, t::T; 
 end
 
 function coherent1D(x::AbstractArray{T,1}, cfg::Config{T}, t; renorm=false) where T
-    coherent1D(x, cfg.α0x, cfg.σx, cfg.ωx, t; renorm=renorm) where T
+    coherent1D(x, cfg.α0x, cfg.σx, cfg.ωx, t; renorm=renorm)
 end
 
 function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1}, t, cfg::Config{T};
@@ -66,7 +69,7 @@ function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1}, t, cfg::Conf
     cfg.α0x, cfg.σx, cfg.ωx,
     cfg.α0y, cfg.σy, cfg.ωy,
     t, cfg.c1, cfg.c2;
-    renorm = renorm, entang = entang) where T
+    renorm = renorm, entang = entang)
 end
 
 function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1},
@@ -81,12 +84,13 @@ function entangled_ψ(x::AbstractArray{T,1}, y::AbstractArray{T,1},
     Nx = length(x); Ny = length(y)
 
     # Construye Nx×Ny = ψ_rx(x) * ψ_ry(y) (outer product con broadcasting)
+    # kron(Ψrx, ψry) might be better
     ψ = c1 .* reshape(ψrx, Nx, 1) .* reshape(ψry, 1, Ny)
 
     if entang
         ψlx = coherent1D(x, α0x, σx+π, ωx, t)
         ψly = coherent1D(y, α0y, σy+π, ωy, t)
-        ψ  += @. c2 * reshape(ψlx, Nx, 1) * reshape(ψry, 1, Ny) # o la combinación que quieras
+        ψ  += @. c2 * reshape(ψlx, Nx, 1) * reshape(ψly, 1, Ny) # o la combinación que quieras
     end
     
     if renorm
@@ -191,6 +195,81 @@ function width(ψ::AbstractArray{T,1}, x) where{T}
     return sqrt(mean_x2 - mean_x^2)
 end
 
+################
+# utils with γ #
+################
+
+function convert_gamma_real_to_psi_real!(ψ::AbstractArray{T,N}, γ::AbstractArray{T,N}, aux::AbstractArray{Complex{T},M}) where {T<:AbstractFloat, N, M}
+    @assert size(γ)[1] == 2
+    @assert size(γ) == size(ψ)
+    @assert size(aux) == size(ψ)[2:end]
+    r_gamma, i_gamma = eachslice(γ, dims=1)
+    map!((x,y)->exp(x+im*y), aux, r_gamma, i_gamma) 
+    convert_psi_to_real!(ψ, aux)
+    return nothing
+end
+
+function convert_psi_real_to_gamma_real!(γ::AbstractArray{T,N}, ψ::AbstractArray{T,N}, aux::AbstractArray{Complex{T},M}) where {T<:AbstractFloat, N, M}
+    @assert size(γ)[1] == 2
+    @assert size(γ) == size(ψ)
+    @assert size(aux) == size(ψ)[2:end]
+    r_psi, i_psi = eachslice(ψ, dims=1)
+    map!((x,y)->log(x+im*y), aux, r_psi, i_psi) 
+    convert_psi_to_real!(γ, aux)
+    return nothing
+end
+
+function ssfm_harosc!(ψ::AbstractArray{T,N}, cfg::Config{T}) where {T<:AbstractFloat,N}
+    FFTW.set_num_threads(Threads.nthreads())
+
+    # make grid
+    x = LinRange(-cfg.Lx/2*(1 - 1/cfg.N), cfg.Lx/2*(1 - 1/cfg.N), cfg.N); # move half-step
+
+    # make fft plans
+    du = similar(ψ)
+
+    plan_f  = FFTW.plan_dct(du, 2; flags=FFTW.MEASURE)
+    k = π .* (collect(0:cfg.N-1)) / cfg.Lx;
+    
+    dt  = cfg.dtmax
+    t0, tf = cfg.tspan
+    steps  = Int(cld(tf - t0, dt))    # ceil division
+    dt_eff = (tf - t0) / steps        # adjust dt to hit tf exactly
+    
+    # Kinetic entire-step: exp(-i (ħ/(2m)) k^2 dt)
+    r_t = @. cos((cfg.ħ/(2cfg.m)) * k^2 * dt_eff)
+    i_t = @. -sin((cfg.ħ/(2cfg.m)) * k^2 * dt_eff)
+
+    # Potential half-step: exp(-i (ω^2*m/(2ħ)) x^2 dt/2)
+    r_v = @. cos( x^2*cfg.ωx^2*cfg.m/(2*cfg.ħ) * dt_eff/2 )
+    i_v = @. -sin( x^2*cfg.ωx^2*cfg.m/(2*cfg.ħ) * dt_eff/2 )
+
+
+    for i in 1:steps 
+        r_ψ, i_ψ = eachslice(ψ, dims=1)
+        r_du, i_du = eachslice(du, dims=1) 
+
+        # potential half-step
+        map!((x,y,a,b)-> a*x - b*y, r_du, r_ψ, i_ψ, r_v, i_v)  
+        map!((x,y,a,b)-> b*x + a*y, i_du, r_ψ, i_ψ, r_v, i_v)  
+
+        # kinetic entire-step
+        mul!(ψ, plan_f, du)
+        map!((x,y,a,b)-> a*x - b*y, r_du, r_ψ, i_ψ, r_t, i_t)  
+        map!((x,y,a,b)-> b*x + a*y, i_du, r_ψ, i_ψ, r_t, i_t)  
+        ldiv!(ψ, plan_f, du)
+
+        # potential half-step
+        map!((x,y,a,b)-> a*x - b*y, r_du, r_ψ, i_ψ, r_v, i_v)  
+        map!((x,y,a,b)-> b*x + a*y, i_du, r_ψ, i_ψ, r_v, i_v)  
+
+        # move all to ψ
+        map!(identity, r_ψ, r_du)
+        map!(identity, i_ψ, i_du)
+    end
+
+    return nothing
+end
 
 #################### 
 # plotting results #
