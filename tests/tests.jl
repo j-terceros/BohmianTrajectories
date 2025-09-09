@@ -87,42 +87,64 @@ includet("utils.jl")
 
         @test isapprox(ψ_0, ψ_f, atol=cfg.dtmax^2, rtol=cfg.dtmax^2*10)
     end
-end
 
-includet("schr_dec.jl")
+    @testset "ssfm decoherence 1D" begin
+        T = Float64
+        cfg = Config{T}(;dtmax=T(0.01), tspan=(T(0), T(20)),
+                    κ=T(-1), ν=T(0.1), saveat=T(0.01)   );
 
-@testset "schr_dec schr" begin
-    T = Float64
-    cfg = Config{T}(; tspan=(T(0), T(1)))
+        # make grid
+        x = LinRange(-cfg.Lx/2*(1 - 1/cfg.N), cfg.Lx/2*(1 - 1/cfg.N), cfg.N); # move half-step
 
-    p = (
-        ch = make_cache_logpsi(cfg),
-        cfg = cfg)
-     
-    # initial condition
-    ψ_0 = convert_psi_to_real(coherent1D(grid(p.ch.D), cfg, cfg.tspan[1]) )
+        # initial condition
+        ψ_0 = convert_psi_to_real(coherent1D(x, cfg, cfg.tspan[1]));
 
-    function f!(du, u, p, t)
-        schr_harosc!(Val(1), du, u, p, t)
+        # evolve using ssfm
+        psis = ssfm_deco_harosc!(ψ_0, cfg);
+        
+        plot_1D_comparision(psis, x, cfg)
+
+        # @show norm(ψ_0 - ψ_f)
+        # @show maximum(abs2.(ψ_0 - ψ_f))
+        #
+        # @test isapprox(ψ_0, ψ_f, atol=cfg.dtmax^2, rtol=cfg.dtmax^2*10)
     end
-
-
-    prob = ODEProblem(f!, ψ_0, cfg.tspan, p)
-    common =(
-        reltol = 1e-7,
-        abstol = 1e-10,
-        dtmax = 0.001,
-        maxiters=Int(1e6),
-    )
-
-    alg = CVODE_BDF(linear_solver=:GMRES, stability_limit_detect=true)
-    sol = solve(prob, alg; common...)
-
-    # final analytic value
-    ψ_f = convert_psi_to_real(coherent1D(grid(p.ch.D), cfg, cfg.tspan[2]) )
-
-    @show norm(sol(cfg.tspan[2]) - ψ_f)
-    @show maximum(abs2.(sol(cfg.tspan[2]) - ψ_f))
-
-    @test isapprox(sol(cfg.tspan[2]), ψ_f, atol=common.dtmax^2, rtol=common.dtmax^2*10)
 end
+
+# includet("schr_dec.jl")
+#
+# @testset "schr_dec schr" begin
+#     T = Float64
+#     cfg = Config{T}(; tspan=(T(0), T(1)))
+#
+#     p = (
+#         ch = make_cache_logpsi(cfg),
+#         cfg = cfg)
+#      
+#     # initial condition
+#     ψ_0 = convert_psi_to_real(coherent1D(grid(p.ch.D), cfg, cfg.tspan[1]) )
+#
+#     function f!(du, u, p, t)
+#         schr_harosc!(Val(1), du, u, p, t)
+#     end
+#
+#
+#     prob = ODEProblem(f!, ψ_0, cfg.tspan, p)
+#     common =(
+#         reltol = 1e-7,
+#         abstol = 1e-10,
+#         dtmax = 0.001,
+#         maxiters=Int(1e6),
+#     )
+#
+#     alg = CVODE_BDF(linear_solver=:GMRES, stability_limit_detect=true)
+#     sol = solve(prob, alg; common...)
+#
+#     # final analytic value
+#     ψ_f = convert_psi_to_real(coherent1D(grid(p.ch.D), cfg, cfg.tspan[2]) )
+#
+#     @show norm(sol(cfg.tspan[2]) - ψ_f)
+#     @show maximum(abs2.(sol(cfg.tspan[2]) - ψ_f))
+#
+#     @test isapprox(sol(cfg.tspan[2]), ψ_f, atol=common.dtmax^2, rtol=common.dtmax^2*10)
+# end

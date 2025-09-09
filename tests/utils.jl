@@ -1,5 +1,5 @@
-# using OrdinaryDiffEq
-# using GLMakie
+using OrdinaryDiffEq
+using GLMakie
 using FFTW
 using LinearAlgebra
 
@@ -107,9 +107,10 @@ end
 function reference_delta_1d(cfg::Config{T}) where T
     δ0 = [sqrt(1/(2*cfg.ωx)), cfg.κ*sqrt(1/(2*cfg.ωx))];
 
+    alg = KenCarp47()
     prob_δ = ODEProblem(diff_width!, δ0, cfg.tspan, cfg);
 
-    sol_δ = solve(prob_δ, reltol=1e-12, abstol=1e-12, saveat = cfg.saveat);
+    sol_δ = solve(prob_δ,alg, reltol=1e-12, abstol=1e-12, saveat = cfg.saveat);
 
     return sol_δ
 end
@@ -183,7 +184,7 @@ function prob_psi(ψ::AbstractArray{Complex{T},N}) where {T<:AbstractFloat,N}
     return prob
 end
 
-function width(ψ::AbstractArray{T,1}, x) where{T}
+function width(ψ::AbstractArray{T,N}, x) where{T,N}
     prob = prob_psi(ψ)
 
     Z = sum(prob)
@@ -219,57 +220,6 @@ function convert_psi_real_to_gamma_real!(γ::AbstractArray{T,N}, ψ::AbstractArr
     return nothing
 end
 
-function ssfm_harosc!(ψ::AbstractArray{T,N}, cfg::Config{T}) where {T<:AbstractFloat,N}
-    FFTW.set_num_threads(Threads.nthreads())
-
-    # make grid
-    x = LinRange(-cfg.Lx/2*(1 - 1/cfg.N), cfg.Lx/2*(1 - 1/cfg.N), cfg.N); # move half-step
-
-    # make fft plans
-    du = similar(ψ)
-
-    plan_f  = FFTW.plan_dct(du, 2; flags=FFTW.MEASURE)
-    k = π .* (collect(0:cfg.N-1)) / cfg.Lx;
-    
-    dt  = cfg.dtmax
-    t0, tf = cfg.tspan
-    steps  = Int(cld(tf - t0, dt))    # ceil division
-    dt_eff = (tf - t0) / steps        # adjust dt to hit tf exactly
-    
-    # Kinetic entire-step: exp(-i (ħ/(2m)) k^2 dt)
-    r_t = @. cos((cfg.ħ/(2cfg.m)) * k^2 * dt_eff)
-    i_t = @. -sin((cfg.ħ/(2cfg.m)) * k^2 * dt_eff)
-
-    # Potential half-step: exp(-i (ω^2*m/(2ħ)) x^2 dt/2)
-    r_v = @. cos( x^2*cfg.ωx^2*cfg.m/(2*cfg.ħ) * dt_eff/2 )
-    i_v = @. -sin( x^2*cfg.ωx^2*cfg.m/(2*cfg.ħ) * dt_eff/2 )
-
-
-    for i in 1:steps 
-        r_ψ, i_ψ = eachslice(ψ, dims=1)
-        r_du, i_du = eachslice(du, dims=1) 
-
-        # potential half-step
-        map!((x,y,a,b)-> a*x - b*y, r_du, r_ψ, i_ψ, r_v, i_v)  
-        map!((x,y,a,b)-> b*x + a*y, i_du, r_ψ, i_ψ, r_v, i_v)  
-
-        # kinetic entire-step
-        mul!(ψ, plan_f, du)
-        map!((x,y,a,b)-> a*x - b*y, r_du, r_ψ, i_ψ, r_t, i_t)  
-        map!((x,y,a,b)-> b*x + a*y, i_du, r_ψ, i_ψ, r_t, i_t)  
-        ldiv!(ψ, plan_f, du)
-
-        # potential half-step
-        map!((x,y,a,b)-> a*x - b*y, r_du, r_ψ, i_ψ, r_v, i_v)  
-        map!((x,y,a,b)-> b*x + a*y, i_du, r_ψ, i_ψ, r_v, i_v)  
-
-        # move all to ψ
-        map!(identity, r_ψ, r_du)
-        map!(identity, i_ψ, i_du)
-    end
-
-    return nothing
-end
 
 #################### 
 # plotting results #
@@ -280,10 +230,9 @@ function plot_1D_comparision(sol_psi, x_cpu, cfg::Config{T}) where {T}
     t_steps = length(sol_δ.t);
     δ_all = zeros(t_steps);
     for i in 1:t_steps
-        δ_all[n] = width(Array(sol_psi(t)), x_cpu)
+        δ_all[i] = width(Array(sol_psi[i]), x_cpu)
     end
 
-    # 4) Grafica
     fig = Figure()
 
     ax1 = Axis(fig[1, 1], xlabel="Time", ylabel="Width")
@@ -293,4 +242,289 @@ function plot_1D_comparision(sol_psi, x_cpu, cfg::Config{T}) where {T}
 
     display(fig)
     return fig
+end
+
+function plottti(i, psis, x)
+    T = eltype(psis[i])
+    fig = Figure()
+    prob = prob_psi(psis[i])
+    r_du, i_du = eachslice(psis[i], dims=1)
+    ang = map((x,y) -> atan(y,x), r_du, i_du)
+    # aa = dct(ang)
+    σ = make_dct_filter(x)
+    # ang .= idct(aa .* σ)
+    #
+    # i_ψ = map((x,y)-> x*sqrt(y), i_du, prob)  # rho[i]*sin(psi[i]) = Im(psi[i])*sqrt(rho[i])
+    # r_ψ = map((x,y)-> x*sqrt(y), r_du, prob)
+    # S̄ = atan(sum(i_ψ), sum(r_ψ))
+
+    ax1 = Axis(fig[1,1])
+    lines!(ax1, x, prob)
+    ax2 = Axis(fig[2,1])
+    lines!(ax2, x, ang)
+    ax3 = Axis(fig[1,2])
+    lines!(ax3, x, psis[i][1,:])
+    ax4 = Axis(fig[2,2])
+    lines!(ax4, x, psis[i][2,:])
+    ax6 = Axis(fig[3,1])
+    lines!(ax6, x, σ)
+
+
+    display(fig)
+    return fig
+end
+
+
+######################
+# functions for ssfm #
+######################
+
+function ssfm_harosc!(ψ::AbstractArray{T,N}, cfg::Config{T}; save=false) where {T<:AbstractFloat,N}
+    dt  = cfg.dtmax
+    t0, tf = cfg.tspan
+    steps  = Int(cld(tf - t0, dt))    # ceil division
+    dt_eff = (tf - t0) / steps        # adjust dt to hit tf exactly
+
+    ch = make_cache_ssfm(ψ, cfg, dt_eff)
+
+    du = similar(ψ)
+
+    if save
+        psis = [copy(ψ)]
+    else
+        psis = nothing
+    end
+
+    for i in 1:steps 
+        # potential half-step
+        # from ψ to du
+        potential_step!(ψ, du, ch)
+
+        # kinetic entire-step
+        # from du to ψ
+        kinetic_step!(ψ, du, ch)
+
+        # potential half-step
+        # from ψ to du
+        potential_step!(ψ, du, ch)
+
+        # move all to ψ
+        # from du to ψ
+        move_all_to_psi!(ψ, du)
+
+        if save
+            push!(psis, copy(ψ))
+        end
+    end
+
+    return psis 
+end
+
+function make_dct_filter(k::AbstractArray{T,N}; kind::Symbol=:exp, p::Int=8, α::Float64=10.0)  where {T,N}
+    n = size(k,1)
+    σ = similar(k)
+    if kind == :exp
+        # exponential/Vandeven-like: σ_m = exp(-α (m/(N-1))^p)
+        # (p even; α~36 gives strong damping near Nyquist while keeping low modes ≈1)
+        denom = max(1, n-1)
+        for m in 0:n-1
+            t = m/denom
+            σ[m+1] = exp(-α * t^p)
+        end
+        σ[1] = T(1)  # exact for m=0
+    else
+        for m in 1:n
+            σ[m] = T(1)
+        end
+    end
+    return σ
+end
+
+function make_cache_ssfm( ψ::AbstractArray{T,N}, cfg::Config{T}, dt_eff) where {T<:AbstractFloat, N}
+    FFTW.set_num_threads(Threads.nthreads())
+
+    x = LinRange(-cfg.Lx/2*(1 - 1/cfg.N), cfg.Lx/2*(1 - 1/cfg.N), cfg.N); # move half-step
+
+    prob = prob_psi(ψ) 
+    ang = similar(prob)
+
+    # Kinetic entire-step
+    plan_f  = FFTW.plan_dct(ψ, 2; flags=FFTW.MEASURE)
+    plan_b  = FFTW.plan_idct(ψ, 2; flags=FFTW.MEASURE)
+    k = π .* (collect(0:cfg.N-1)) / cfg.Lx;
+
+    r_kin = @. cos((cfg.ħ/(2cfg.m)) * k^2 * dt_eff)
+    i_kin = @. -sin((cfg.ħ/(2cfg.m)) * k^2 * dt_eff)
+
+    # filter in fourier space
+    σ = make_dct_filter(k)
+
+    # Potential half-step
+    dt_pot = dt_eff/2
+    r_pot = @. cos( x^2*cfg.ωx^2*cfg.m/(2*cfg.ħ) * dt_pot )
+    i_pot = @. -sin( x^2*cfg.ωx^2*cfg.m/(2*cfg.ħ) * dt_pot )
+
+    # Kappa potential fourth-step
+    dt_kappa = dt_eff/4
+    pκ = exp(-2*cfg.κ*dt_kappa)
+
+    # Nu potential half step
+    dt_nu = dt_pot
+    νdt = cfg.ν*dt_nu#*0.95
+
+    return CacheSSFM{T,1,typeof(plan_f),typeof(plan_b)}(prob, ang, r_pot, i_pot, r_kin, i_kin, 
+                                                        σ, plan_f, plan_b, pκ, νdt, 
+                                                        x .^2 *cfg.ωx^2*cfg.m/(2*cfg.ħ) * dt_pot )
+end
+
+struct CacheSSFM{T<:AbstractFloat,M,PlanF,PlanB}
+    prob::AbstractArray{T,M}
+    ang::AbstractArray{T,M}
+    r_pot::AbstractArray{T,M}
+    i_pot::AbstractArray{T,M}
+    r_kin::AbstractArray{T,M}
+    i_kin::AbstractArray{T,M}
+    σ::AbstractArray{T,1}
+    plan_f::PlanF
+    plan_b::PlanB
+    pκ::T
+    νdt::T
+    x::AbstractArray{T,M}
+end
+
+function kinetic_step!(ψ::AbstractArray{T,N}, du::AbstractArray{T,N}, ch::CacheSSFM) where{T<:AbstractFloat,N}
+    # from du to ψ
+    r_ψ, i_ψ = eachslice(ψ, dims=1)
+    r_du, i_du = eachslice(du, dims=1) 
+    mul!(ψ, ch.plan_f, du) 
+    map!((x,y,a,b)-> a*x - b*y, r_du, r_ψ, i_ψ, ch.r_kin, ch.i_kin)  
+    map!((x,y,a,b)-> b*x + a*y, i_du, r_ψ, i_ψ, ch.r_kin, ch.i_kin)  
+    # # filter
+    map!((x,y)-> x*y, r_du, r_du, ch.σ)
+    map!((x,y)-> x*y, i_du, i_du, ch.σ)
+
+    mul!(ψ, ch.plan_b, du)
+    return nothing
+end
+
+function potential_step!(ψ::AbstractArray{T,N}, du::AbstractArray{T,N}, ch::CacheSSFM) where{T<:AbstractFloat,N}
+    # from ψ to du
+    r_ψ, i_ψ = eachslice(ψ, dims=1)
+    r_du, i_du = eachslice(du, dims=1) 
+    map!((x,y,a,b)-> a*x - b*y, r_du, r_ψ, i_ψ, ch.r_pot, ch.i_pot)  
+    map!((x,y,a,b)-> b*x + a*y, i_du, r_ψ, i_ψ, ch.r_pot, ch.i_pot)  
+    return nothing
+end
+
+function move_all_to_psi!(ψ::AbstractArray{T,N}, du::AbstractArray{T,N})  where{T<:AbstractFloat,N}
+    r_ψ, i_ψ = eachslice(ψ, dims=1)
+    r_du, i_du = eachslice(du, dims=1) 
+    map!(identity, r_ψ, r_du)
+    map!(identity, i_ψ, i_du)
+    return nothing
+end
+
+function kappa_step!(ψ::AbstractArray{T,N}, du::AbstractArray{T,N}, ch::CacheSSFM) where {T<:AbstractFloat, N}
+    # from ψ to du
+    pκ = ch.pκ
+
+    # find rho
+    prob_psi!(ch.prob, ψ)
+    map!(x->x^pκ, ch.ang, ch.prob)
+
+    # aux vars
+    c = sqrt(sum(ch.prob) / sum(ch.ang))
+
+    # update
+    r_ψ, i_ψ = eachslice(ψ, dims=1)
+    r_du, i_du = eachslice(du, dims=1) 
+    map!((x,y)->c*x*y^((pκ-1)/2), i_du, i_ψ, ch.prob)
+    map!((x,y)->c*x*y^((pκ-1)/2), r_du, r_ψ, ch.prob)
+
+    return nothing
+end
+
+function nu_potential_step!(ψ::AbstractArray{T,N}, du::AbstractArray{T,N}, ch::CacheSSFM) where{T<:AbstractFloat,N}
+    # from du to ψ
+    νdt = ch.νdt
+
+    r_ψ, i_ψ = eachslice(ψ, dims=1)
+    r_du, i_du = eachslice(du, dims=1) 
+
+    # find rho and angle
+    prob_psi!(ch.prob, du)
+    map!((x,y)->atan(y,x), ch.ang, r_du, i_du)
+    
+    # find circular mean
+    map!((x,y)-> x*sqrt(y), i_ψ, i_du, ch.prob)  # rho[i]*sin(psi[i]) = Im(psi[i])*sqrt(rho[i])
+    map!((x,y)-> x*sqrt(y), r_ψ, r_du, ch.prob)
+    S̄ = atan(sum(i_ψ), sum(r_ψ))
+
+    # phase change operator  (here we make du to ψ)
+    map!((θ,v,x,y)-> cos(νdt * f_pi(θ - S̄) + v)*x - sin(-νdt * f_pi(θ - S̄) -v )*y, r_ψ, ch.ang, ch.x, r_du, i_du)
+    map!((θ,v, x,y)-> sin(-νdt * f_pi(θ - S̄) - v)*x + cos(νdt * f_pi(θ - S̄) + v)*y, i_ψ, ch.ang, ch.x, r_du, i_du)
+
+    
+    return nothing
+end
+
+@inline function f_pi(x)
+    mod(x + π, 2π) - π
+end
+
+function ssfm_deco_harosc!(ψ::AbstractArray{T,N}, cfg::Config{T}, save=true) where {T<:AbstractFloat,N}
+    dt  = cfg.dtmax
+    t0, tf = cfg.tspan
+    steps  = Int(cld(tf - t0, dt))    # ceil division
+    dt_eff = (tf - t0) / steps        # adjust dt to hit tf exactly
+
+    ch = make_cache_ssfm(ψ, cfg, dt_eff)
+
+    du = similar(ψ)
+
+    if save
+        psis = [copy(ψ)]
+    else
+        psis = nothing
+    end
+
+    for i in 1:steps 
+        # kappa fourth-step
+        # from ψ to du
+        kappa_step!(ψ, du, ch)
+
+        # nu potential half-step
+        # from du to ψ 
+        nu_potential_step!(ψ, du, ch)
+
+        # kappa fourth-step
+        # from ψ to du
+        kappa_step!(ψ, du, ch)
+
+        # kinetic entire-step
+        # from du to ψ
+        kinetic_step!(ψ, du, ch)
+
+        # kappa fourth-step
+        # from ψ to du
+        kappa_step!(ψ, du, ch)
+
+        # nu potential half-step
+        # from du to ψ 
+        nu_potential_step!(ψ, du, ch)
+
+        # kappa fourth-step
+        # from ψ to du
+        kappa_step!(ψ, du, ch)
+
+        # move all to ψ
+        # from du to ψ
+        move_all_to_psi!(ψ, du)
+
+        if save
+            push!(psis, copy(ψ))
+        end
+    end
+
+    return psis 
 end

@@ -36,7 +36,6 @@ function main()
     # define algorithm
 
     # solve problem
-
 end
 
 struct CacheLogPsi{T<:AbstractFloat,N,M,LeftBC,RightBC}
